@@ -1,0 +1,30 @@
+# Core Jupyter and IPython
+notebook==6.0.1
+jupyterlab==1.1.4
+ipython==7.18.1
+ipywidgets==7.5.1
+ipykernel
+
+# Scientific Computing
+numpy==1.19.5
+pandas==1.2.4
+scipy==1.3.1
+scikit-learn==0.23.2
+matplotlib==3.3.1
+
+# 3D Visualization - VTK and related
+vtk==8.1.2
+vedo==2020.4.2
+k3d==2.7.1
+
+# ITK libraries
+itkwidgets==0.24.1
+itk-core==5.0.1
+itk-filtering==5.0.1
+itk-numerics==5.0.1
+itk-registration==5.0.1
+
+# Additional utilities
+python-dateutil==2.8.0
+meshio==3.3.1
+pyevtk==1.1.1
