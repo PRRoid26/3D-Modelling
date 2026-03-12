@@ -1,0 +1,1168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lithosync</title>
+
+  <link rel="icon" type="image/png" href="/static/images/logoLithosync-removebg-preview.png" />
+  <link rel="stylesheet" href="https://js.arcgis.com/4.29/esri/themes/dark/main.css" />
+  <script src="https://js.arcgis.com/4.29/"></script>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Mono:wght@300;400;500&display=swap" rel="stylesheet" />
+
+  <style>
+    /* ── Reset & Base ─────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --ink:        #020408;
+      --deep:       #0d2035;
+      --mid:        #132c45;
+      --surface:    #1a3a55;
+      --glass:      rgba(2, 4, 8, 0.82);
+      --glass2:     rgba(13, 32, 53, 0.90);
+      --accent:     #00d4ff;
+      --accent2:    #0099cc;
+      --warn:       #f0a500;
+      --danger:     #e05252;
+      --success:    #28d17c;
+      --log-accent: #ff9f43;   /* orange — log pipeline / 3D boreholes */
+      --text:       #cde8f8;
+      --muted:      #6a9ab8;
+      --border:     rgba(0, 212, 255, 0.18);
+      --radius:     10px;
+      --shadow:     0 8px 32px rgba(0,0,0,0.6), 0 1px 0 rgba(0,212,255,0.08);
+    }
+
+    html, body { width:100%; height:100%; overflow:hidden; font-family:'DM Mono', monospace; background:var(--ink); color:var(--text); }
+
+    /* ── Map Container ──────────────────────────────────────────── */
+    #viewDiv { width:100%; height:100vh; }
+
+    /* ── Panel Base ─────────────────────────────────────────────── */
+    .panel {
+      position: absolute; z-index: 10;
+      background: var(--glass);
+      backdrop-filter: blur(18px) saturate(160%);
+      -webkit-backdrop-filter: blur(18px) saturate(160%);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      color: var(--text);
+    }
+
+    /* ── Search Bar ─────────────────────────────────────────────── */
+    #searchPanel { top: 18px; left: 18px; width: 320px; }
+    #searchInner { display:flex; align-items:center; gap:0; padding:4px 4px 4px 14px; }
+    #searchInput {
+      flex:1; background:transparent; border:none; outline:none;
+      color:var(--text); font-family:'DM Mono',monospace; font-size:13.5px;
+      padding:8px 6px 8px 0; caret-color:var(--accent);
+    }
+    #searchInput::placeholder { color:var(--muted); }
+    #searchBtn {
+      background:var(--accent); border:none; border-radius:7px;
+      width:36px; height:36px; cursor:pointer; display:flex;
+      align-items:center; justify-content:center; transition:background .2s; flex-shrink:0;
+    }
+    #searchBtn:hover { background:var(--accent2); }
+    #searchBtn svg { width:17px; height:17px; fill:none; stroke:var(--ink); stroke-width:2.2; }
+    #searchSuggestions { display:none; border-top:1px solid var(--border); max-height:200px; overflow-y:auto; }
+    .suggest-item { padding:9px 14px; font-size:12.5px; cursor:pointer; border-bottom:1px solid rgba(0,212,255,0.07); transition:background .15s; }
+    .suggest-item:hover { background:rgba(0,212,255,0.1); }
+    .suggest-item .addr { color:var(--muted); font-size:11px; margin-top:2px; }
+
+    /* ── Right Toolbar ──────────────────────────────────────────── */
+    #rightToolbar {
+      position:absolute; right:18px; bottom:18px;
+      display:flex; flex-direction:column; align-items:center; gap:6px; z-index:10;
+    }
+    .tool-btn {
+      width:42px; height:42px;
+      background:var(--glass2); border:1px solid var(--border); border-radius:10px;
+      color:var(--text); font-size:18px; cursor:pointer;
+      display:flex; align-items:center; justify-content:center;
+      transition:all .18s; backdrop-filter:blur(14px);
+      position:relative; flex-shrink:0;
+    }
+    .tool-btn:hover, .tool-btn.active {
+      background:rgba(0,212,255,0.18); border-color:var(--accent); color:var(--accent);
+    }
+    .tool-btn.log-active {
+      background:rgba(255,159,67,0.18); border-color:var(--log-accent); color:var(--log-accent);
+    }
+    .tool-btn .badge {
+      position:absolute; top:-5px; right:-5px;
+      width:14px; height:14px; background:var(--success);
+      border-radius:50%; font-size:8px; display:none;
+      align-items:center; justify-content:center; color:#000; font-weight:700;
+    }
+    .tool-btn .badge.show { display:flex; }
+    .tool-btn .badge.log  { background:var(--log-accent); color:#000; }
+    .tool-divider { width:28px; height:1px; background:var(--border); margin:2px 0; }
+
+    /* ── Flyout panels ──────────────────────────────────────────── */
+    .flyout {
+      position:absolute; right:54px; bottom:0; width:270px;
+      background:var(--glass2); border:1px solid var(--border);
+      border-radius:var(--radius); box-shadow:var(--shadow);
+      backdrop-filter:blur(18px); padding:14px;
+      display:none; max-height:calc(100vh - 36px); overflow-y:auto;
+      scrollbar-width:thin; scrollbar-color:var(--surface) transparent;
+    }
+    .flyout.open { display:block; }
+
+    /* Basemap grid */
+    #basemapGrid { display:grid; grid-template-columns:1fr 1fr; gap:6px; margin-top:6px; }
+    .bm-item { border-radius:8px; overflow:hidden; cursor:pointer; border:2px solid transparent; transition:all .2s; }
+    .bm-item:hover { border-color:var(--accent2); transform:scale(1.02); }
+    .bm-item.active { border-color:var(--accent); box-shadow:0 0 10px rgba(0,212,255,.3); }
+    .bm-item img { width:100%; height:42px; object-fit:cover; display:block; filter:brightness(.85) saturate(1.1); background:var(--mid); }
+    .bm-label { padding:4px 6px; font-size:10px; font-family:'Syne',sans-serif; font-weight:600; letter-spacing:.05em; background:var(--mid); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .bm-item.active .bm-label { color:var(--accent); }
+
+    /* Panel section title */
+    .panel-title {
+      font-family:'Syne',sans-serif; font-size:11px; font-weight:700;
+      letter-spacing:.12em; text-transform:uppercase; color:var(--accent);
+      margin-bottom:8px; display:flex; align-items:center; gap:6px;
+    }
+    .panel-title.log-title { color:var(--log-accent); }
+    .panel-title .dot { width:6px; height:6px; border-radius:50%; background:var(--accent); animation:pulse 2s infinite; }
+    .panel-title.log-title .dot { background:var(--log-accent); }
+
+    /* Drop zone */
+    #dropZone, #logDropZone {
+      border:1.5px dashed var(--border); border-radius:8px; padding:12px 10px;
+      text-align:center; cursor:pointer; transition:all .2s;
+    }
+    #dropZone:hover, #dropZone.drag-over,
+    #logDropZone:hover, #logDropZone.drag-over { border-color:var(--accent); background:rgba(0,212,255,0.06); }
+    #logDropZone:hover, #logDropZone.drag-over { border-color:var(--log-accent); background:rgba(255,159,67,0.06); }
+    .dz-icon { font-size:20px; margin-bottom:3px; }
+    .dz-text { font-size:11.5px; color:var(--muted); line-height:1.5; }
+    .dz-text strong { color:var(--accent); }
+    #fileInput, #logFileInput { display:none; }
+    .upload-status { margin-top:8px; font-size:11px; min-height:16px; line-height:1.5; }
+    .upload-status.ok   { color:var(--success); }
+    .upload-status.err  { color:var(--danger); }
+    .upload-status.info { color:var(--muted); }
+    .clear-btn {
+      display:none; margin-top:8px; width:100%; padding:6px;
+      background:rgba(224,82,82,0.18); border:1px solid rgba(224,82,82,0.4);
+      border-radius:6px; color:#f08888; font-size:11px; cursor:pointer;
+      font-family:'DM Mono',monospace; transition:background .2s;
+    }
+    .clear-btn:hover { background:rgba(224,82,82,0.32); }
+
+    /* Log pipeline specific */
+    #logFlyout { border-color:rgba(255,159,67,0.25); }
+    .log-process-btn {
+      margin-top:10px; width:100%; padding:8px;
+      background:rgba(255,159,67,0.20); border:1px solid rgba(255,159,67,0.45);
+      border-radius:6px; color:var(--log-accent); font-size:12px; cursor:pointer;
+      font-family:'DM Mono',monospace; font-weight:600; transition:background .2s;
+    }
+    .log-process-btn:hover { background:rgba(255,159,67,0.35); }
+    .log-process-btn:disabled { opacity:.45; cursor:not-allowed; }
+    .log-download-btn {
+      display:none; margin-top:6px; width:100%; padding:6px;
+      background:rgba(40,209,124,0.15); border:1px solid rgba(40,209,124,0.35);
+      border-radius:6px; color:var(--success); font-size:11px; cursor:pointer;
+      font-family:'DM Mono',monospace; transition:background .2s;
+    }
+    .log-download-btn:hover { background:rgba(40,209,124,0.28); }
+    .pipeline-badge {
+      display:inline-block; margin-top:6px; padding:3px 8px;
+      background:rgba(255,159,67,0.18); border:1px solid rgba(255,159,67,0.35);
+      border-radius:12px; font-size:10px; color:var(--log-accent);
+    }
+
+    /* ── Coords badge ───────────────────────────────────────────── */
+    #coordsBadge {
+      position:absolute; bottom:16px; left:50%; transform:translateX(-50%);
+      background:var(--glass); border:1px solid var(--border); border-radius:20px;
+      padding:5px 16px; font-size:12px; color:var(--muted); pointer-events:none;
+      z-index:10; backdrop-filter:blur(12px); white-space:nowrap;
+    }
+    #coordsBadge span { color:var(--accent); }
+
+    /* ── Map dim overlay when panel open ───────────────────────── */
+    #panelBackdrop {
+      position:fixed; top:0; left:0; right:40vw; bottom:0; z-index:90;
+      background:rgba(5,12,22,0.45);
+      backdrop-filter:blur(2px);
+      display:none; pointer-events:none;
+      transition:opacity .32s;
+      opacity:0;
+    }
+    #panelBackdrop.show { display:block; opacity:1; pointer-events:auto; }
+
+    /* ── Right-side full-height panel ───────────────────────────── */
+    #boreholePopup {
+      position:fixed; z-index:100;
+      top:0; right:0;
+      width:40vw; min-width:0; max-width:none;
+      height:100vh;
+      background: linear-gradient(160deg, rgba(10,22,38,0.97) 0%, rgba(13,32,53,0.98) 100%);
+      border-left:1px solid var(--border);
+      box-shadow:-12px 0 48px rgba(0,0,0,0.7), -1px 0 0 rgba(0,212,255,0.08);
+      display:flex; flex-direction:column;
+      transform:translateX(100%);
+      transition:transform .34s cubic-bezier(.22,.68,0,1.1);
+      overflow:hidden;
+    }
+    #boreholePopup.show { transform:translateX(0); }
+
+    /* ── Panel header bar ───────────────────────────────────────── */
+    .popup-header {
+      display:flex; align-items:center; justify-content:space-between;
+      padding:14px 20px; flex-shrink:0;
+      border-bottom:1px solid var(--border);
+      background:linear-gradient(90deg, rgba(0,212,255,.12) 0%, transparent 60%);
+    }
+    .popup-header.log-header {
+      background:linear-gradient(90deg, rgba(255,159,67,.15) 0%, transparent 60%);
+    }
+    .popup-title-group { display:flex; align-items:center; gap:10px; }
+    .popup-bh-id {
+      font-family:'Syne',sans-serif; font-size:18px; font-weight:800;
+      color:var(--accent); letter-spacing:.03em;
+    }
+    .popup-header.log-header .popup-bh-id { color:var(--log-accent); }
+    .popup-3d-badge {
+      font-size:10px; background:rgba(255,159,67,0.15);
+      border:1px solid rgba(255,159,67,0.40);
+      border-radius:12px; padding:3px 10px;
+      color:var(--log-accent); font-weight:600; letter-spacing:.04em;
+    }
+    .popup-close {
+      width:32px; height:32px; border-radius:8px;
+      background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.1);
+      color:var(--muted); font-size:18px; line-height:1;
+      cursor:pointer; display:flex; align-items:center; justify-content:center;
+      transition:all .15s; flex-shrink:0;
+    }
+    .popup-close:hover { background:rgba(224,82,82,0.2); border-color:var(--danger); color:var(--danger); }
+
+    /* ── Panel body: left info + right 3D ───────────────────────── */
+    .popup-content-wrapper {
+      display:flex; flex:1; overflow:hidden; min-height:0;
+    }
+
+    /* LEFT — scrollable info column */
+    .popup-info-pane {
+      flex: 0 0 52%;
+      overflow-y:auto; padding:14px 16px;
+      border-right:1px solid var(--border);
+      scrollbar-width:thin; scrollbar-color:var(--surface) transparent;
+      background:rgba(8,18,30,0.4);
+    }
+
+    .info-section-title {
+      font-family:'Syne',sans-serif; font-size:9px; font-weight:700;
+      text-transform:uppercase; letter-spacing:.14em;
+      color:var(--muted); margin:14px 0 6px;
+      padding-bottom:4px; border-bottom:1px solid rgba(0,212,255,0.10);
+    }
+    .info-section-title:first-child { margin-top:0; }
+
+    .popup-row {
+      display:flex; justify-content:space-between; align-items:flex-start;
+      padding:5px 0; border-bottom:1px solid rgba(0,212,255,0.05);
+      gap:8px;
+    }
+    .popup-row:last-child { border-bottom:none; }
+    .popup-key {
+      color:var(--muted); text-transform:uppercase;
+      font-size:10px; letter-spacing:.06em; flex-shrink:0; padding-top:1px;
+    }
+    .popup-val {
+      color:var(--text); font-size:12px; text-align:right;
+      word-break:break-word; line-height:1.4;
+    }
+    .popup-val.accent { color:var(--accent); font-weight:600; }
+    .popup-val.log-accent-val { color:var(--log-accent); font-weight:600; }
+
+    /* Stratigraphy */
+    .strat-section { margin-top:14px; }
+    .strat-title {
+      font-family:'Syne',sans-serif; font-size:9px; font-weight:700;
+      text-transform:uppercase; letter-spacing:.14em;
+      color:var(--muted); margin-bottom:8px;
+      padding-bottom:4px; border-bottom:1px solid rgba(0,212,255,0.10);
+    }
+    .strat-table { width:100%; border-collapse:collapse; font-size:11px; }
+    .strat-table th {
+      color:var(--muted); font-size:9px; text-transform:uppercase;
+      letter-spacing:.06em; padding:4px 6px;
+      border-bottom:1px solid var(--border); text-align:left;
+    }
+    .strat-table td {
+      padding:5px 6px; border-bottom:1px solid rgba(0,212,255,0.05);
+      vertical-align:top; line-height:1.45;
+      transition: background .18s, box-shadow .18s, color .18s;
+    }
+    .strat-table tr:last-child td { border-bottom:none; }
+    .strat-table tr:hover td { background:rgba(0,212,255,0.05); }
+
+    /* ── 3D hover highlight — matches your orange reference image ── */
+    .strat-table tr.layer-highlight td {
+      background: rgba(255, 159, 67, 0.35) !important;
+      border-top: 1px solid rgba(255, 159, 67, 0.5) !important;
+      border-bottom: 1px solid rgba(255, 159, 67, 0.5) !important;
+      transition: all 0.1s ease-in-out;
+    }
+
+    .strat-table tr.layer-highlight td:first-child {
+      background: rgba(255, 159, 67, 0.45) !important;
+      border-left: 4px solid #ff9f43 !important;
+      color: #fff !important;
+      font-weight: 800 !important;
+      text-shadow: 0 0 8px rgba(255, 159, 67, 0.8);
+      padding-left: 4px;
+    }
+
+    .strat-table tr.layer-highlight td:last-child {
+      color: #fff !important;
+      font-weight: 600;
+    }
+
+    .strat-table td:first-child {
+      color:var(--log-accent); white-space:nowrap;
+      font-size:10px; font-weight:600; padding-right:8px;
+    }
+    .strat-table td:last-child { color:var(--text); }
+
+    /* RIGHT — 3D iframe pane */
+    #popup3dPane {
+      flex: 0 0 48%;
+      display:none; flex-direction:column;
+      background:#000; min-width:0; overflow:hidden;
+    }
+    #popup3dPane.visible { display:flex; }
+
+    #popup3dPaneHeader {
+      display:flex; align-items:center; justify-content:space-between;
+      padding:9px 16px; flex-shrink:0;
+      background:rgba(255,159,67,0.06);
+      border-bottom:1px solid rgba(255,159,67,0.15);
+    }
+    .viz-header-left {
+      display:flex; align-items:center; gap:8px;
+      font-family:'Syne',sans-serif; font-size:10px; font-weight:700;
+      letter-spacing:.12em; text-transform:uppercase; color:var(--log-accent);
+    }
+    .viz-pulse { width:7px; height:7px; border-radius:50%; background:var(--log-accent); animation:pulse 2s infinite; }
+    .viz-hint { font-size:10px; color:var(--muted); letter-spacing:0; font-family:'DM Mono',monospace; }
+
+    #borehole3dFrame {
+      flex:1; width:100%; border:none; background:#000;
+      display:block; min-height:0;
+    }
+
+    /* No-3D placeholder */
+    #no3dPlaceholder {
+      flex:1; display:none; flex-direction:column;
+      align-items:center; justify-content:center;
+      color:var(--muted); gap:10px; padding:30px;
+      background:#0b1420;
+    }
+    #no3dPlaceholder.visible { display:flex; }
+    .no3d-icon { font-size:40px; opacity:.35; }
+    .no3d-text { font-size:12px; text-align:center; line-height:1.6; }
+
+    /* ── Overlay layers panel ───────────────────────────────────── */
+    #overlayPanel { position:absolute; left:18px; bottom:24px; width:240px; z-index:10; }
+    .overlay-toggle-btn {
+      background:var(--glass); border:1px solid var(--border); border-radius:var(--radius);
+      padding:9px 14px; cursor:pointer; width:100%; text-align:left;
+      font-family:'Syne',sans-serif; font-size:11px; font-weight:700;
+      letter-spacing:.1em; text-transform:uppercase; color:var(--accent);
+      backdrop-filter:blur(12px); display:flex; justify-content:space-between; align-items:center; transition:background .2s;
+    }
+    .overlay-toggle-btn:hover { background:rgba(0,212,255,0.1); }
+    #overlayContent { display:none; margin-top:6px; background:var(--glass); border:1px solid var(--border); border-radius:var(--radius); padding:10px 12px; backdrop-filter:blur(18px); }
+    #overlayContent.open { display:block; }
+    .overlay-item { display:flex; align-items:center; gap:9px; padding:5px 0; cursor:pointer; font-size:11.5px; border-bottom:1px solid rgba(0,212,255,0.05); }
+    .overlay-item:last-child { border-bottom:none; }
+    .overlay-item input[type=checkbox] { accent-color:var(--accent); width:14px; height:14px; }
+    .overlay-item label { cursor:pointer; flex:1; line-height:1.4; }
+    .overlay-item .lyr-tag { font-size:9.5px; padding:1px 5px; border-radius:4px; background:rgba(0,212,255,.12); color:var(--accent); flex-shrink:0; }
+
+    /* ── Loading overlay ────────────────────────────────────────── */
+    #loadingOverlay {
+      position:fixed; inset:0; 
+      background: #040817;
+      display:flex; flex-direction:column; align-items:center; justify-content:center;
+      z-index:9999; transition:opacity 0.8s ease-out;
+    }
+    .load-logo-container {
+      width: 320px;
+      margin-bottom: 20px;
+      animation: logoEntrance 1s ease-out;
+      background: transparent;
+
+    }
+    .load-logo-container img {
+      width: 100%;
+      height: auto;
+      display: block;
+      mix-blend-mode: lighten;
+    }
+    #loadingOverlay.fade { opacity:0; pointer-events:none; }
+    .load-title { font-family:'Syne',sans-serif; font-size:28px; font-weight:800; color:var(--accent); margin-bottom:8px; }
+    .load-sub { 
+      font-family: 'Syne', sans-serif;
+      font-size: 11px; 
+      letter-spacing: 0.2em;
+      text-transform: uppercase;
+      color: var(--muted); 
+      margin-bottom: 24px; 
+      opacity: 0.8;
+    }
+    
+    .load-bar { width: 180px; height: 2px; background: rgba(0, 212, 255, 0.1); border-radius: 2px; overflow: hidden; }
+    .load-fill { height: 100%; width: 0; background: var(--accent); border-radius: 2px; animation: loadAnim 2s cubic-bezier(0.4, 0, 0.2, 1) forwards; }
+    @keyframes loadAnim { to { width:100%; } }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+    @keyframes logoEntrance {
+      from { opacity: 0; transform: scale(0.9); filter: blur(10px); }
+      to { opacity: 1; transform: scale(1); filter: blur(0); }
+    }
+
+
+    /* ── Scrollbar ──────────────────────────────────────────────── */
+    ::-webkit-scrollbar { width:5px; }
+    ::-webkit-scrollbar-track { background:transparent; }
+    ::-webkit-scrollbar-thumb { background:var(--surface); border-radius:3px; }
+
+    /* ── ESRI overrides ─────────────────────────────────────────── */
+    .esri-view .esri-view-surface--inset-outline:focus::after { outline:none; }
+    .esri-ui-top-left, .esri-ui-top-right, .esri-ui-bottom-left, .esri-ui-bottom-right { display:none !important; }
+
+    /* ── UTM input ──────────────────────────────────────────────── */
+    .utm-row { display:flex; align-items:center; gap:8px; margin-top:8px; }
+    .utm-row label { font-size:11px; color:var(--muted); flex:1; }
+    .utm-zone-input {
+      width:54px; padding:4px 6px; background:var(--mid); border:1px solid var(--border);
+      border-radius:6px; color:var(--accent); font-family:'DM Mono',monospace; font-size:12px;
+      text-align:center; outline:none;
+    }
+    .utm-zone-input:focus { border-color:var(--accent); }
+    .utm-hint { font-size:10px; color:var(--muted); margin-top:4px; line-height:1.4; }
+  </style>
+</head>
+<body>
+
+<div id="loadingOverlay">
+  <div class="load-logo-container">
+    <!-- Ensure the path matches where you save the uploaded logo -->
+    <img src="/static/images/LithoSync.png" alt="Lithosync Logo">
+  </div>
+  <div class="load-sub">Initializing Lithosync GIS</div>
+  <div class="load-bar"><div class="load-fill"></div></div>
+</div>
+
+<div id="viewDiv"></div>
+
+<div class="panel" id="searchPanel">
+  <div id="searchInner">
+    <svg viewBox="0 0 24 24" style="width:16px;height:16px;flex-shrink:0;opacity:.5;margin-right:6px"><circle cx="11" cy="11" r="8" stroke="#00d4ff" stroke-width="2" fill="none"/><line x1="16.5" y1="16.5" x2="22" y2="22" stroke="#00d4ff" stroke-width="2"/></svg>
+    <input id="searchInput" type="text" placeholder="Search Lithosync database..." autocomplete="off" />
+    <button id="searchBtn" title="Search">
+      <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="16.5" y1="16.5" x2="22" y2="22" stroke-linecap="round"/></svg>
+    </button>
+  </div>
+  <div id="searchSuggestions"></div>
+</div>
+
+<div id="overlayPanel">
+  <button class="overlay-toggle-btn" id="overlayToggleBtn">
+    <span>⚡ Overlay Layers</span>
+    <span id="overlayArrow">▲</span>
+  </button>
+  <div id="overlayContent"></div>
+</div>
+
+<div id="rightToolbar">
+
+  <div class="flyout" id="basemapFlyout">
+    <div class="panel-title"><div class="dot"></div>Base Maps</div>
+    <div id="basemapGrid"></div>
+  </div>
+  <button class="tool-btn" id="btnBasemap" title="Switch Basemap">🗺</button>
+
+  <div class="flyout" id="uploadFlyout">
+    <div class="panel-title"><div class="dot"></div>Borehole Data</div>
+    <div id="dropZone">
+      <div class="dz-icon">📂</div>
+      <div class="dz-text">Drop <strong>.xlsx</strong> / <strong>.csv</strong><br>or click to browse</div>
+      <input type="file" id="fileInput" accept=".xlsx,.xls,.csv" />
+    </div>
+    <div class="utm-row">
+      <label>UTM Zone (if coords are m E/N):</label>
+      <input id="utmZone" class="utm-zone-input" type="number" min="1" max="60" value="43" />
+    </div>
+    <div class="utm-hint">Mumbai/Maharashtra = 43 · Bay of Bengal = 44–45 · Leave as-is for decimal degrees</div>
+    <div id="uploadStatus" class="upload-status info">No file loaded</div>
+    <button id="clearBoreholes" class="clear-btn">✕ Clear all boreholes</button>
+  </div>
+  <button class="tool-btn" id="btnUpload" title="Upload Borehole Data">
+    📂 <span class="badge" id="boreholeBadge">✓</span>
+  </button>
+
+  <div class="flyout" id="logFlyout">
+    <div class="panel-title log-title"><div class="dot"></div>Log Pipeline  <span class="pipeline-badge" id="pipelineBadge" style="display:none">✓ Ready</span></div>
+    <div style="font-size:10px;color:var(--muted);margin-bottom:8px;line-height:1.5">
+      Upload a <strong style="color:var(--log-accent)">logData.xlsx</strong> file to auto-colour stratigraphy,
+      generate a processed workbook, and embed a live 3D view in each borehole popup.
+    </div>
+    <div id="logDropZone">
+      <div class="dz-icon">📊</div>
+      <div class="dz-text">Drop <strong>logData.xlsx</strong><br>or click to browse</div>
+      <input type="file" id="logFileInput" accept=".xlsx,.xls" />
+    </div>
+    <div class="utm-row">
+      <label>UTM Zone:</label>
+      <input id="logUtmZone" class="utm-zone-input" type="number" min="1" max="60" value="43" />
+    </div>
+    <div class="utm-hint">Must match the zone used in your borehole coordinates</div>
+    <button class="log-process-btn" id="logProcessBtn" disabled>⚙ Process &amp; Plot</button>
+    <div id="logStatus" class="upload-status info" style="margin-top:6px"></div>
+    <button class="log-download-btn" id="logDownloadBtn">⬇ Download my_output.xlsx</button>
+    <button id="clearLogBoreholes" class="clear-btn" style="border-color:rgba(255,159,67,0.4);color:#ffb87a">✕ Clear log boreholes</button>
+  </div>
+  <button class="tool-btn" id="btnLog" title="Log Pipeline — 3D Borehole View">
+    📊 <span class="badge log" id="logBadge">✓</span>
+  </button>
+
+  <div class="tool-divider"></div>
+
+  <button class="tool-btn" id="zoomIn"  title="Zoom In">＋</button>
+  <button class="tool-btn" id="zoomOut" title="Zoom Out">－</button>
+</div>
+
+<div id="coordsBadge">Move cursor over map</div>
+
+<div id="panelBackdrop"></div>
+
+<div id="boreholePopup">
+
+  <div class="popup-header" id="popupHeader">
+    <div class="popup-title-group">
+      <span class="popup-bh-id" id="popupTitle">BH-?</span>
+      <span class="popup-3d-badge" id="popup3dBadge" style="display:none">⚙ 3D READY</span>
+    </div>
+    <span class="popup-close" id="popupClose" title="Close">×</span>
+  </div>
+
+  <div class="popup-content-wrapper">
+
+    <div class="popup-info-pane" id="popupBody"></div>
+
+    <div id="popup3dPane">
+      <div id="popup3dPaneHeader">
+        <div class="viz-header-left">
+          <div class="viz-pulse"></div>
+          3D Stratigraphic View
+        </div>
+        <span class="viz-hint">Drag → rotate &nbsp;·&nbsp; Scroll → zoom</span>
+      </div>
+      <iframe id="borehole3dFrame" src="about:blank" allowfullscreen></iframe>
+    </div>
+
+    <div id="no3dPlaceholder">
+      <div class="no3d-icon">🧊</div>
+      <div class="no3d-text">3D view available for boreholes<br>processed through the <strong style="color:var(--log-accent)">Log Pipeline</strong>.<br><br>Upload a logData.xlsx using the 📊 button.</div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+require([
+  "esri/Map",
+  "esri/views/MapView",
+  "esri/layers/MapImageLayer",
+  "esri/layers/ImageryLayer",
+  "esri/Graphic",
+  "esri/layers/GraphicsLayer",
+  "esri/geometry/Point",
+  "esri/symbols/SimpleMarkerSymbol",
+  "esri/symbols/TextSymbol",
+  "esri/request"
+], function(
+  EsriMap, MapView, MapImageLayer, ImageryLayer,
+  Graphic, GraphicsLayer, Point,
+  SimpleMarkerSymbol, TextSymbol, esriRequest
+) {
+
+  // ── Basemap definitions ──────────────────────────────────────
+  const BASEMAPS = [
+    { id:"oceans",              label:"Oceans",      thumb:"https://js.arcgis.com/4.29/esri/themes/dark/images/basemap/oceans.jpg" },
+    { id:"satellite",           label:"Satellite",   thumb:"https://js.arcgis.com/4.29/esri/themes/dark/images/basemap/satellite.jpg" },
+    { id:"topo-vector",         label:"Topo",        thumb:"https://js.arcgis.com/4.29/esri/themes/dark/images/basemap/topo-vector.jpg" },
+    { id:"dark-gray-vector",    label:"Dark Gray",   thumb:"https://js.arcgis.com/4.29/esri/themes/dark/images/basemap/dark-gray-vector.jpg" },
+    { id:"gray-vector",         label:"Light Gray",  thumb:"https://js.arcgis.com/4.29/esri/themes/dark/images/basemap/gray-vector.jpg" },
+    { id:"streets-vector",      label:"Streets",     thumb:"https://js.arcgis.com/4.29/esri/themes/dark/images/basemap/streets-vector.jpg" },
+    { id:"national-geographic", label:"Nat Geo",     thumb:"https://js.arcgis.com/4.29/esri/themes/dark/images/basemap/national-geographic.jpg" },
+    { id:"terrain",             label:"Terrain",     thumb:"https://js.arcgis.com/4.29/esri/themes/dark/images/basemap/terrain.jpg" },
+  ];
+
+  // ── Overlay layer configs ────────────────────────────────────
+  const NOAA_URL = 'https://gis.ngdc.noaa.gov/arcgis/rest/services';
+  const USGS_URL = 'https://earthquake.usgs.gov/arcgis/rest/services';
+  const OVERLAYS = [
+    { id:'bathy_hillshade', label:'Bathymetry Hillshade', tag:'NOAA', url:`${NOAA_URL}/DEM_mosaics/DEM_global_mosaic_hillshade/ImageServer`,  type:'imagery', opacity:0.75 },
+    { id:'etopo1',          label:'ETOPO1 Bedrock',       tag:'NOAA', url:`${NOAA_URL}/DEM_mosaics/ETOPO1_bedrock/ImageServer`,               type:'imagery', opacity:0.70 },
+    { id:'emag2',           label:'Magnetic Anomaly',     tag:'NOAA', url:`${NOAA_URL}/EMAG2v3/ImageServer`,                                   type:'imagery', opacity:0.65 },
+    { id:'gebco',           label:'GEBCO Contours',       tag:'NOAA', url:`${NOAA_URL}/wgs84/gebco_2019_contours/MapServer`,                   type:'map',     opacity:0.80 },
+    { id:'multibeam',       label:'Multibeam Sonar',      tag:'NOAA', url:`${NOAA_URL}/wgs84/multibeam_footprints/MapServer`,                  type:'map',     opacity:0.60 },
+    { id:'plates',          label:'Plate Boundaries',     tag:'USGS', url:`${USGS_URL}/eq/map_plateboundaries/MapServer`,                      type:'map',     opacity:0.90 },
+    { id:'faults',          label:'Fault Lines',          tag:'USGS', url:`${USGS_URL}/eq/map_faults/MapServer`,                               type:'map',     opacity:0.80 },
+    { id:'coastlines',      label:'Coastlines',           tag:'NOAA', url:`${NOAA_URL}/reference/coastlines/MapServer`,                        type:'map',     opacity:1.00 },
+  ];
+
+  // ── Map & View ───────────────────────────────────────────────
+  const map  = new EsriMap({ basemap: 'oceans' });
+  const view = new MapView({
+    container: 'viewDiv',
+    map,
+    zoom:   5,
+    center: [72.8, 18.9],
+    ui:     { components: [] },
+  });
+
+  // ── Graphics layers ──────────────────────────────────────────
+  const boreholeLayer    = new GraphicsLayer();   // regular upload
+  const logBoreholeLayer = new GraphicsLayer();   // log-pipeline (orange)
+  const overlayLayers    = {};
+  map.addMany([boreholeLayer, logBoreholeLayer]);
+
+  // ── Hide loading screen ──────────────────────────────────────
+  view.when(() => {
+    setTimeout(() => {
+      document.getElementById('loadingOverlay').classList.add('fade');
+    }, 2000);
+  });
+
+  // ── Mouse-move coordinate badge ──────────────────────────────
+  view.on('pointer-move', evt => {
+    const pt = view.toMap({ x: evt.x, y: evt.y });
+    if (pt) {
+      document.getElementById('coordsBadge').innerHTML =
+        `<span>${pt.latitude.toFixed(5)}°N</span>&nbsp;&nbsp;<span>${pt.longitude.toFixed(5)}°E</span>`;
+    }
+  });
+
+  // ── Zoom buttons ─────────────────────────────────────────────
+  document.getElementById('zoomIn') .addEventListener('click', () => view.zoom++);
+  document.getElementById('zoomOut').addEventListener('click', () => view.zoom--);
+
+  // ── Overlay layers ───────────────────────────────────────────
+  const overlayContent = document.getElementById('overlayContent');
+  OVERLAYS.forEach(cfg => {
+    const item = document.createElement('div');
+    item.className = 'overlay-item';
+    item.innerHTML = `
+      <input type="checkbox" id="lyr_${cfg.id}" />
+      <label for="lyr_${cfg.id}">${cfg.label}</label>
+      <span class="lyr-tag">${cfg.tag}</span>`;
+    overlayContent.appendChild(item);
+    item.querySelector('input').addEventListener('change', e => {
+      if (e.target.checked) {
+        const Cls = cfg.type === 'imagery' ? ImageryLayer : MapImageLayer;
+        overlayLayers[cfg.id] = new Cls({ url: cfg.url, opacity: cfg.opacity });
+        map.add(overlayLayers[cfg.id]);
+      } else {
+        if (overlayLayers[cfg.id]) { map.remove(overlayLayers[cfg.id]); delete overlayLayers[cfg.id]; }
+      }
+    });
+  });
+
+  document.getElementById('overlayToggleBtn').addEventListener('click', () => {
+    const c = document.getElementById('overlayContent');
+    const a = document.getElementById('overlayArrow');
+    c.classList.toggle('open');
+    a.textContent = c.classList.contains('open') ? '▼' : '▲';
+  });
+
+  // ── Basemap grid ─────────────────────────────────────────────
+  const bmGrid = document.getElementById('basemapGrid');
+  BASEMAPS.forEach(bm => {
+    const el = document.createElement('div');
+    el.className = 'bm-item' + (bm.id === 'oceans' ? ' active' : '');
+    el.innerHTML = `<img src="${bm.thumb}" alt="${bm.label}" onerror="this.style.display='none'"><div class="bm-label">${bm.label}</div>`;
+    el.addEventListener('click', () => {
+      map.basemap = bm.id;
+      bmGrid.querySelectorAll('.bm-item').forEach(i => i.classList.remove('active'));
+      el.classList.add('active');
+    });
+    bmGrid.appendChild(el);
+  });
+
+  // ── Flyout toggle helper ─────────────────────────────────────
+  function makeFlyoutToggle(btnId, flyoutId, activeClass) {
+    const btn    = document.getElementById(btnId);
+    const flyout = document.getElementById(flyoutId);
+    const allFlyouts = ['basemapFlyout', 'uploadFlyout', 'logFlyout'];
+    const allBtns    = ['btnBasemap', 'btnUpload', 'btnLog'];
+    btn.addEventListener('click', () => {
+      const isOpen = flyout.classList.contains('open');
+      // close all
+      allFlyouts.forEach(id => document.getElementById(id).classList.remove('open'));
+      allBtns.forEach(id => {
+        document.getElementById(id).classList.remove('active');
+        document.getElementById(id).classList.remove('log-active');
+      });
+      if (!isOpen) {
+        flyout.classList.add('open');
+        btn.classList.add(activeClass || 'active');
+      }
+    });
+  }
+
+  makeFlyoutToggle('btnBasemap', 'basemapFlyout', 'active');
+  makeFlyoutToggle('btnUpload',  'uploadFlyout',  'active');
+  makeFlyoutToggle('btnLog',     'logFlyout',     'log-active');
+
+  // Close flyouts on outside click
+  document.addEventListener('click', e => {
+    if (!document.getElementById('rightToolbar').contains(e.target)) {
+      ['basemapFlyout','uploadFlyout','logFlyout'].forEach(id =>
+        document.getElementById(id).classList.remove('open'));
+      ['btnBasemap','btnUpload','btnLog'].forEach(id => {
+        document.getElementById(id).classList.remove('active','log-active');
+      });
+    }
+  });
+
+  // ── Search ───────────────────────────────────────────────────
+  const searchInput   = document.getElementById('searchInput');
+  const suggestions   = document.getElementById('searchSuggestions');
+
+  function performSearch(query) {
+    query = query.trim();
+    if (!query) return;
+    suggestions.style.display = 'none';
+    const latlon = query.match(/^([+-]?\d+\.?\d*)\s*,\s*([+-]?\d+\.?\d*)$/);
+    if (latlon) {
+      const lat = parseFloat(latlon[1]), lon = parseFloat(latlon[2]);
+      view.goTo({ center: [lon, lat], zoom: 10 }, { duration: 800 }).catch(() => {});
+      return;
+    }
+    fetch(`https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(query)}&format=json&limit=5`)
+      .then(r => r.json()).then(results => {
+        if (!results.length) {
+          suggestions.innerHTML = '<div class="suggest-item" style="color:var(--muted)">No results found</div>';
+          suggestions.style.display = 'block'; return;
+        }
+        suggestions.innerHTML = '';
+        results.forEach(r => {
+          const item = document.createElement('div');
+          item.className = 'suggest-item';
+          item.innerHTML = `${r.display_name.split(',')[0]}<div class="addr">${r.display_name}</div>`;
+          item.addEventListener('click', () => {
+            view.goTo({ center: [parseFloat(r.lon), parseFloat(r.lat)], zoom: 10 }, { duration: 800 }).catch(() => {});
+            searchInput.value = r.display_name.split(',')[0];
+            suggestions.style.display = 'none';
+          });
+          suggestions.appendChild(item);
+        });
+        suggestions.style.display = 'block';
+      }).catch(() => {
+        suggestions.innerHTML = '<div class="suggest-item" style="color:var(--danger)">Geocoding service unavailable</div>';
+        suggestions.style.display = 'block';
+      });
+  }
+
+  document.getElementById('searchBtn').addEventListener('click', () => performSearch(searchInput.value));
+  searchInput.addEventListener('keydown', e => { if (e.key === 'Enter') performSearch(searchInput.value); });
+  searchInput.addEventListener('input',   () => { if (!searchInput.value.trim()) suggestions.style.display = 'none'; });
+  document.addEventListener('click', e => {
+    if (!document.getElementById('searchPanel').contains(e.target)) suggestions.style.display = 'none';
+  });
+
+  // ═══════════════════════════════════════════════════════════════
+  // REGULAR BOREHOLE UPLOAD
+  // ═══════════════════════════════════════════════════════════════
+  const dropZone  = document.getElementById('dropZone');
+  const fileInput = document.getElementById('fileInput');
+  const statusEl  = document.getElementById('uploadStatus');
+  const clearBtn  = document.getElementById('clearBoreholes');
+
+  dropZone.addEventListener('click', () => fileInput.click());
+  dropZone.addEventListener('dragover',  e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
+  dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
+  dropZone.addEventListener('drop', e => {
+    e.preventDefault(); dropZone.classList.remove('drag-over');
+    if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
+  });
+  fileInput.addEventListener('change', () => { if (fileInput.files[0]) handleFile(fileInput.files[0]); });
+
+  clearBtn.addEventListener('click', () => {
+    boreholeLayer.removeAll();
+    boreholeData = {};
+    statusEl.textContent = 'No file loaded'; statusEl.className = 'upload-status info';
+    clearBtn.style.display = 'none'; fileInput.value = '';
+    document.getElementById('boreholeBadge').classList.remove('show');
+    closePopup();
+  });
+
+  function setStatus(el, msg, cls) { el.textContent = msg; el.className = 'upload-status ' + cls; }
+
+  function handleFile(file) {
+    setStatus(statusEl, 'Uploading…', 'info');
+    const fd = new FormData();
+    fd.append('file', file);
+    fd.append('utm_zone', document.getElementById('utmZone').value || '43');
+    fetch('/api/upload_boreholes', { method:'POST', body:fd })
+      .then(r => r.json()).then(data => {
+        if (data.error) { setStatus(statusEl, '⚠ ' + data.error, 'err'); return; }
+        boreholeLayer.removeAll(); boreholeData = {};
+        plotBoreholes(data.boreholes, boreholeLayer, boreholeData, false);
+        setStatus(statusEl, `✓ ${data.count} boreholes loaded`, 'ok');
+        clearBtn.style.display = 'block';
+        document.getElementById('boreholeBadge').classList.add('show');
+        document.getElementById('uploadFlyout').classList.remove('open');
+        document.getElementById('btnUpload').classList.remove('active');
+        zoomToBoreholes(data.boreholes);
+      })
+      .catch(() => setStatus(statusEl, '⚠ Upload failed — is Flask running?', 'err'));
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // LOG PIPELINE  (ruleScript → borehole_3d_viz → 3D popup)
+  // ═══════════════════════════════════════════════════════════════
+  const logDropZone  = document.getElementById('logDropZone');
+  const logFileInput = document.getElementById('logFileInput');
+  const logStatus    = document.getElementById('logStatus');
+  const logProcessBtn   = document.getElementById('logProcessBtn');
+  const logDownloadBtn  = document.getElementById('logDownloadBtn');
+  const clearLogBtn     = document.getElementById('clearLogBoreholes');
+
+  let logPendingFile = null;
+
+  // Check pipeline availability on load
+  fetch('/api/pipeline_status').then(r => r.json()).then(d => {
+    if (d.available) {
+      logProcessBtn.disabled = false;
+      setStatus(logStatus, '✓ Pipeline ready (ruleScript + borehole_3d_viz detected)', 'ok');
+    } else {
+      setStatus(logStatus, '⚠ Pipeline modules not found: ' + (d.error || ''), 'err');
+    }
+  }).catch(() => {});
+
+  logDropZone.addEventListener('click', () => logFileInput.click());
+  logDropZone.addEventListener('dragover',  e => { e.preventDefault(); logDropZone.classList.add('drag-over'); });
+  logDropZone.addEventListener('dragleave', () => logDropZone.classList.remove('drag-over'));
+  logDropZone.addEventListener('drop', e => {
+    e.preventDefault(); logDropZone.classList.remove('drag-over');
+    if (e.dataTransfer.files[0]) selectLogFile(e.dataTransfer.files[0]);
+  });
+  logFileInput.addEventListener('change', () => { if (logFileInput.files[0]) selectLogFile(logFileInput.files[0]); });
+
+  function selectLogFile(file) {
+    logPendingFile = file;
+    logDropZone.querySelector('.dz-text').innerHTML =
+      `<strong style="color:var(--log-accent)">${file.name}</strong><br><span style="font-size:10px;color:var(--muted)">${(file.size/1024).toFixed(1)} KB — ready to process</span>`;
+    setStatus(logStatus, 'File selected. Click ⚙ Process to run pipeline.', 'info');
+    logDownloadBtn.style.display = 'none';
+  }
+
+  logProcessBtn.addEventListener('click', () => {
+    if (!logPendingFile) { setStatus(logStatus, '⚠ Please select a log file first.', 'err'); return; }
+    runLogPipeline(logPendingFile);
+  });
+
+  function runLogPipeline(file) {
+    setStatus(logStatus, '⏳ Running pipeline… (colour → 3D)', 'info');
+    logProcessBtn.disabled = true;
+    logDownloadBtn.style.display = 'none';
+
+    const fd = new FormData();
+    fd.append('file', file);
+    fd.append('utm_zone', document.getElementById('logUtmZone').value || '43');
+
+    fetch('/api/process_log', { method:'POST', body:fd })
+      .then(r => r.json()).then(data => {
+        logProcessBtn.disabled = false;
+        if (data.error) { setStatus(logStatus, '⚠ ' + data.error, 'err'); return; }
+
+        logBoreholeLayer.removeAll(); logBoreholeData = {};
+        plotBoreholes(data.boreholes, logBoreholeLayer, logBoreholeData, true);
+
+        setStatus(logStatus,
+          `✓ ${data.count} boreholes processed — click any orange dot for 3D view`, 'ok');
+
+        logDownloadBtn.style.display = 'block';
+        clearLogBtn.style.display = 'block';
+        document.getElementById('logBadge').classList.add('show');
+        document.getElementById('pipelineBadge').style.display = '';
+        document.getElementById('btnLog').classList.add('log-active');
+        document.getElementById('logFlyout').classList.remove('open');
+
+        zoomToBoreholes(data.boreholes);
+      })
+      .catch(() => {
+        logProcessBtn.disabled = false;
+        setStatus(logStatus, '⚠ Request failed — is Flask running?', 'err');
+      });
+  }
+
+  logDownloadBtn.addEventListener('click', () => {
+    window.location.href = '/api/download_processed';
+  });
+
+  clearLogBtn.addEventListener('click', () => {
+    logBoreholeLayer.removeAll(); logBoreholeData = {};
+    clearLogBtn.style.display = 'none';
+    logDownloadBtn.style.display = 'none';
+    document.getElementById('logBadge').classList.remove('show');
+    document.getElementById('pipelineBadge').style.display = 'none';
+    document.getElementById('btnLog').classList.remove('log-active');
+    logPendingFile = null;
+    logDropZone.querySelector('.dz-text').innerHTML =
+      'Drop <strong>logData.xlsx</strong><br>or click to browse';
+    setStatus(logStatus, '', 'info');
+    closePopup();
+  });
+
+  // ═══════════════════════════════════════════════════════════════
+  // SHARED: plot borehole markers
+  // ═══════════════════════════════════════════════════════════════
+  let boreholeData    = {};   // id → record (regular)
+  let logBoreholeData = {};   // id → record (log pipeline)
+
+  function plotBoreholes(boreholes, layer, dataStore, isLog) {
+    const glowColor = isLog ? [255, 159, 67, 40]  : [0, 212, 255, 35];
+    const coreColor = isLog ? [255, 159, 67, 230] : [0, 212, 255, 230];
+    const glowOutline= isLog ? [255, 159, 67, 100] : [0, 212, 255, 90];
+
+    boreholes.forEach(bh => {
+      dataStore[bh.id] = bh;
+      layer.addMany([
+        new Graphic({
+          geometry: new Point({ longitude: bh.lon, latitude: bh.lat }),
+          symbol: new SimpleMarkerSymbol({
+            style: 'circle', color: glowColor, size: 22,
+            outline: { color: glowOutline, width: 1 },
+          }),
+          attributes: { boreholeId: bh.id, isLog: isLog },
+        }),
+        new Graphic({
+          geometry: new Point({ longitude: bh.lon, latitude: bh.lat }),
+          symbol: new SimpleMarkerSymbol({
+            style: 'circle', color: coreColor, size: 10,
+            outline: { color: [255, 255, 255, 200], width: 1.5 },
+          }),
+          attributes: { boreholeId: bh.id, isLog: isLog, type: 'core' },
+        }),
+      ]);
+    });
+  }
+
+  function zoomToBoreholes(boreholes) {
+    if (!boreholes.length) return;
+    const lats = boreholes.map(b => b.lat);
+    const lons = boreholes.map(b => b.lon);
+    const pad  = 0.5;
+    view.goTo({
+      target: {
+        type: 'extent',
+        xmin: Math.min(...lons) - pad, ymin: Math.min(...lats) - pad,
+        xmax: Math.max(...lons) + pad, ymax: Math.max(...lats) + pad,
+        spatialReference: { wkid: 4326 },
+      }
+    }, { duration: 1000 }).catch(() => {});
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // POPUP — click handler
+  // ═══════════════════════════════════════════════════════════════
+  view.on('click', evt => {
+    view.hitTest(evt).then(response => {
+      // Check log layer first (higher priority — orange markers)
+      let hit = response.results.find(r =>
+        r.graphic && r.graphic.attributes &&
+        r.graphic.attributes.isLog === true &&
+        r.graphic.attributes.type  === 'core');
+
+      if (hit) {
+        const bh = logBoreholeData[hit.graphic.attributes.boreholeId];
+        if (bh) { showBoreholePopup(bh, evt.x, evt.y, true); return; }
+      }
+
+      // Then regular layer
+      hit = response.results.find(r =>
+        r.graphic && r.graphic.attributes &&
+        r.graphic.attributes.isLog !== true &&
+        r.graphic.attributes.type  === 'core');
+
+      if (hit) {
+        const bh = boreholeData[hit.graphic.attributes.boreholeId];
+        if (bh) { showBoreholePopup(bh, evt.x, evt.y, false); return; }
+      }
+
+      closePopup();
+    });
+  });
+
+  // ── Panel open/close ─────────────────────────────────────────
+  function closePopup() {
+    document.getElementById('boreholePopup').classList.remove('show');
+    document.getElementById('panelBackdrop').classList.remove('show');
+    document.getElementById('borehole3dFrame').src = 'about:blank';
+    document.getElementById('popup3dPane').classList.remove('visible');
+    document.getElementById('no3dPlaceholder').classList.remove('visible');
+  }
+
+  // Close on backdrop click
+  document.getElementById('panelBackdrop').addEventListener('click', closePopup);
+
+  function showBoreholePopup(bh, screenX, screenY, isLog) {
+    const popup       = document.getElementById('boreholePopup');
+    const header      = document.getElementById('popupHeader');
+    const title       = document.getElementById('popupTitle');
+    const badge       = document.getElementById('popup3dBadge');
+    const body        = document.getElementById('popupBody');
+    const pane3d      = document.getElementById('popup3dPane');
+    const placeholder = document.getElementById('no3dPlaceholder');
+    const frame       = document.getElementById('borehole3dFrame');
+
+    // ── Header ──────────────────────────────────────────────
+    header.className = 'popup-header' + (isLog ? ' log-header' : '');
+    title.textContent = `BH-${bh.borehole_no}`;
+    badge.style.display = (bh.has_3d && isLog) ? '' : 'none';
+
+    // ── Text info ────────────────────────────────────────────
+    body.innerHTML = '';
+
+    // Core metrics as big cards
+    const cards = [];
+    if (bh.max_depth  != null) cards.push({ label:'Max Depth',   value: bh.max_depth + ' m',         accent: true });
+    if (bh.water_depth)        cards.push({ label:'Water Depth', value: bh.water_depth,               accent: false });
+    if (bh.layers_count!= null) cards.push({ label:'Layers',     value: bh.layers_count + ' strat.',  accent: false });
+
+    if (cards.length) {
+      const cardsHtml = cards.map(c => `
+        <div style="flex:1;min-width:80px;background:rgba(0,212,255,0.05);
+                    border:1px solid var(--border);border-radius:8px;
+                    padding:10px 10px 8px;text-align:center">
+          <div style="font-size:17px;font-weight:700;font-family:'Syne',sans-serif;
+                      color:${c.accent ? 'var(--log-accent)' : 'var(--accent)'}">${c.value}</div>
+          <div style="font-size:9px;color:var(--muted);text-transform:uppercase;
+                      letter-spacing:.08em;margin-top:2px">${c.label}</div>
+        </div>`).join('');
+      body.innerHTML += `<div style="display:flex;gap:8px;margin-bottom:14px">${cardsHtml}</div>`;
+    }
+
+    // Location section
+    body.innerHTML += `<div class="info-section-title">📍 Location</div>`;
+    const locFields = [
+      ['Borehole No.', bh.borehole_no],
+      ['Latitude',     bh.lat ? bh.lat.toFixed(6) + '°' : null],
+      ['Longitude',    bh.lon ? bh.lon.toFixed(6) + '°' : null],
+      ['UTM Coords',   bh.coordinates_raw],
+    ];
+    locFields.forEach(([k, v]) => {
+      if (!v || v === 'undefined') return;
+      body.innerHTML += `<div class="popup-row">
+        <span class="popup-key">${k}</span>
+        <span class="popup-val">${v}</span></div>`;
+    });
+
+    // Extra fields
+    const skip = new Set(['id','borehole_no','lat','lon','water_depth','coordinates_raw',
+                          'stratigraphy','has_3d','max_depth','layers_count']);
+    const extras = Object.entries(bh).filter(([k,v]) => !skip.has(k) && v);
+    if (extras.length) {
+      body.innerHTML += `<div class="info-section-title">📋 Details</div>`;
+      extras.forEach(([k,v]) => {
+        body.innerHTML += `<div class="popup-row">
+          <span class="popup-key">${k.replace(/_/g,' ')}</span>
+          <span class="popup-val">${v}</span></div>`;
+      });
+    }
+
+    // Corrected Stratigraphy Table with Data Attributes for matching
+    if (bh.stratigraphy && bh.stratigraphy.length) {
+      const sec = document.createElement('div');
+      sec.className = 'strat-section';
+      sec.innerHTML = `<div class="strat-title">⛏ Stratigraphy — ${bh.stratigraphy.length} Layers</div>`;
+      const tbl = document.createElement('table');
+      tbl.className = 'strat-table';
+      tbl.innerHTML = `<thead><tr><th>Depth</th><th>Description</th></tr></thead>`;
+      const tb = document.createElement('tbody');
+      
+      bh.stratigraphy.forEach(l => {
+        const tr = document.createElement('tr');
+        // CRITICAL: Numeric fields for matching 3D hover accurately 
+        if (l.depth_top != null) tr.dataset.dtop = l.depth_top;
+        if (l.depth_bot != null) tr.dataset.dbot = l.depth_bot;
+        tr.innerHTML = `<td>${l.depth||'—'}</td><td>${l.description||'—'}</td>`;
+        tb.appendChild(tr);
+      });
+      tbl.appendChild(tb); sec.appendChild(tbl); body.appendChild(sec);
+    }
+
+    // Handle 3D Iframe
+    if (bh.has_3d && isLog) {
+      frame.src = `/api/borehole_3d/${bh.id}`;
+      pane3d.classList.add('visible');
+      placeholder.classList.remove('visible');
+    } else {
+      frame.src = 'about:blank';
+      pane3d.classList.remove('visible');
+      placeholder.classList.add('visible');
+    }
+
+    popup.classList.add('show');
+    document.getElementById('panelBackdrop').classList.add('show');
+  }
+
+  document.getElementById('popupClose').addEventListener('click', closePopup);
+
+  // ═══════════════════════════════════════════════════════════════
+  // 3D IFRAME → PARENT: layer hover highlights strat table row
+  // ═══════════════════════════════════════════════════════════════
+  window.addEventListener('message', evt => {
+    if (!evt.data || !evt.data.type) return;
+
+    const rows = document.querySelectorAll('#popupBody .strat-table tbody tr');
+
+    if (evt.data.type === 'bhLayerHover') {
+      const dtop = parseFloat(evt.data.depth_top);
+      const dbot = parseFloat(evt.data.depth_bot);
+
+      rows.forEach(tr => {
+        tr.classList.remove('layer-highlight');
+        const rTop = parseFloat(tr.dataset.dtop);
+        const rBot = parseFloat(tr.dataset.dbot);
+        // Matching with small tolerance check for floating point numbers 
+        if (!isNaN(rTop) && Math.abs(rTop - dtop) < 0.05 && Math.abs(rBot - dbot) < 0.05) {
+          tr.classList.add('layer-highlight');
+          // Scroll highlighted row into view automatically 
+          tr.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+        }
+      });
+    }
+
+    if (evt.data.type === 'bhLayerUnhover') {
+      rows.forEach(tr => tr.classList.remove('layer-highlight'));
+    }
+  });
+
+});
+</script>
+
+<script>
+  // Lithosync branding — dynamic loading text
+  const loadSub = document.querySelector('.load-sub');
+  setTimeout(() => { if (loadSub) loadSub.innerText = "Synchronizing Lithology Data..."; }, 800);
+</script>
+</body>
+</html>
