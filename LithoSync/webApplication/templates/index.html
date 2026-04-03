@@ -7,6 +7,11 @@
 
   <link rel="icon" type="image/png" href="/static/images/logoLithosync-removebg-preview.png" />
   <link rel="stylesheet" href="https://js.arcgis.com/4.29/esri/themes/dark/main.css" />
+  
+  <!-- 1. MUST BE FIRST: Load Socket.IO so it doesn't collide with ArcGIS -->
+  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+  
+  <!-- 2. THEN load ArcGIS -->
   <script src="https://js.arcgis.com/4.29/"></script>
 
   <link rel="preconnect" href="https://fonts.googleapis.com" />
@@ -308,7 +313,6 @@
     .strat-table tr:last-child td { border-bottom:none; }
     .strat-table tr:hover td { background:rgba(0,212,255,0.05); }
 
-    /* ── 3D hover highlight — matches your orange reference image ── */
     .strat-table tr.layer-highlight td {
       background: rgba(255, 159, 67, 0.35) !important;
       border-top: 1px solid rgba(255, 159, 67, 0.5) !important;
@@ -459,7 +463,6 @@
 
 <div id="loadingOverlay">
   <div class="load-logo-container">
-    <!-- Ensure the path matches where you save the uploaded logo -->
     <img src="/static/images/LithoSync.png" alt="Lithosync Logo">
   </div>
   <div class="load-sub">Initializing Lithosync GIS</div>
@@ -601,7 +604,9 @@ require([
 ) {
 
   // ── Basemap definitions ──────────────────────────────────────
+  // Changed default from "oceans" to "osm" (OpenStreetMap) as it doesn't require an API Key.
   const BASEMAPS = [
+    { id:"osm",                 label:"OSM",         thumb:"https://js.arcgis.com/4.29/esri/themes/dark/images/basemap/osm.jpg" },
     { id:"oceans",              label:"Oceans",      thumb:"https://js.arcgis.com/4.29/esri/themes/dark/images/basemap/oceans.jpg" },
     { id:"satellite",           label:"Satellite",   thumb:"https://js.arcgis.com/4.29/esri/themes/dark/images/basemap/satellite.jpg" },
     { id:"topo-vector",         label:"Topo",        thumb:"https://js.arcgis.com/4.29/esri/themes/dark/images/basemap/topo-vector.jpg" },
@@ -627,7 +632,7 @@ require([
   ];
 
   // ── Map & View ───────────────────────────────────────────────
-  const map  = new EsriMap({ basemap: 'oceans' });
+  const map  = new EsriMap({ basemap: 'osm' });
   const view = new MapView({
     container: 'viewDiv',
     map,
@@ -636,20 +641,23 @@ require([
     ui:     { components: [] },
   });
 
-  // ── Graphics layers ──────────────────────────────────────────
-  const boreholeLayer    = new GraphicsLayer();   // regular upload
-  const logBoreholeLayer = new GraphicsLayer();   // log-pipeline (orange)
+  const boreholeLayer    = new GraphicsLayer();
+  const logBoreholeLayer = new GraphicsLayer(); 
   const overlayLayers    = {};
   map.addMany([boreholeLayer, logBoreholeLayer]);
 
-  // ── Hide loading screen ──────────────────────────────────────
+  // Normal path — map loaded successfully
   view.when(() => {
-    setTimeout(() => {
-      document.getElementById('loadingOverlay').classList.add('fade');
-    }, 2000);
+    if (window._dismissLoader) window._dismissLoader('Map ready ✓');
+  }).catch(err => {
+    console.error('[ArcGIS] view.when() rejected:', err);
+    const el = document.querySelector('.load-sub');
+    if (el) { el.style.color = '#e05252'; el.innerText = '⚠ Map failed — tools still available'; }
+    setTimeout(() => document.getElementById('loadingOverlay').classList.add('fade'), 2000);
+    clearTimeout(window._loaderHardTimer);
+    clearInterval(window._loaderMsgTimer);
   });
 
-  // ── Mouse-move coordinate badge ──────────────────────────────
   view.on('pointer-move', evt => {
     const pt = view.toMap({ x: evt.x, y: evt.y });
     if (pt) {
@@ -658,11 +666,9 @@ require([
     }
   });
 
-  // ── Zoom buttons ─────────────────────────────────────────────
   document.getElementById('zoomIn') .addEventListener('click', () => view.zoom++);
   document.getElementById('zoomOut').addEventListener('click', () => view.zoom--);
 
-  // ── Overlay layers ───────────────────────────────────────────
   const overlayContent = document.getElementById('overlayContent');
   OVERLAYS.forEach(cfg => {
     const item = document.createElement('div');
@@ -690,11 +696,11 @@ require([
     a.textContent = c.classList.contains('open') ? '▼' : '▲';
   });
 
-  // ── Basemap grid ─────────────────────────────────────────────
   const bmGrid = document.getElementById('basemapGrid');
   BASEMAPS.forEach(bm => {
     const el = document.createElement('div');
-    el.className = 'bm-item' + (bm.id === 'oceans' ? ' active' : '');
+    // Ensure OSM has the active class initialized since it's our new default
+    el.className = 'bm-item' + (bm.id === 'osm' ? ' active' : '');
     el.innerHTML = `<img src="${bm.thumb}" alt="${bm.label}" onerror="this.style.display='none'"><div class="bm-label">${bm.label}</div>`;
     el.addEventListener('click', () => {
       map.basemap = bm.id;
@@ -704,7 +710,6 @@ require([
     bmGrid.appendChild(el);
   });
 
-  // ── Flyout toggle helper ─────────────────────────────────────
   function makeFlyoutToggle(btnId, flyoutId, activeClass) {
     const btn    = document.getElementById(btnId);
     const flyout = document.getElementById(flyoutId);
@@ -712,16 +717,9 @@ require([
     const allBtns    = ['btnBasemap', 'btnUpload', 'btnLog'];
     btn.addEventListener('click', () => {
       const isOpen = flyout.classList.contains('open');
-      // close all
       allFlyouts.forEach(id => document.getElementById(id).classList.remove('open'));
-      allBtns.forEach(id => {
-        document.getElementById(id).classList.remove('active');
-        document.getElementById(id).classList.remove('log-active');
-      });
-      if (!isOpen) {
-        flyout.classList.add('open');
-        btn.classList.add(activeClass || 'active');
-      }
+      allBtns.forEach(id => { document.getElementById(id).classList.remove('active'); document.getElementById(id).classList.remove('log-active'); });
+      if (!isOpen) { flyout.classList.add('open'); btn.classList.add(activeClass || 'active'); }
     });
   }
 
@@ -729,20 +727,17 @@ require([
   makeFlyoutToggle('btnUpload',  'uploadFlyout',  'active');
   makeFlyoutToggle('btnLog',     'logFlyout',     'log-active');
 
-  // Close flyouts on outside click
   document.addEventListener('click', e => {
     if (!document.getElementById('rightToolbar').contains(e.target)) {
-      ['basemapFlyout','uploadFlyout','logFlyout'].forEach(id =>
-        document.getElementById(id).classList.remove('open'));
-      ['btnBasemap','btnUpload','btnLog'].forEach(id => {
-        document.getElementById(id).classList.remove('active','log-active');
-      });
+      ['basemapFlyout','uploadFlyout','logFlyout'].forEach(id => document.getElementById(id).classList.remove('open'));
+      ['btnBasemap','btnUpload','btnLog'].forEach(id => { document.getElementById(id).classList.remove('active','log-active'); });
     }
   });
 
-  // ── Search ───────────────────────────────────────────────────
+  // ── Search (with simple debounce to protect external API) ───
   const searchInput   = document.getElementById('searchInput');
   const suggestions   = document.getElementById('searchSuggestions');
+  let searchTimeout;
 
   function performSearch(query) {
     query = query.trim();
@@ -754,37 +749,39 @@ require([
       view.goTo({ center: [lon, lat], zoom: 10 }, { duration: 800 }).catch(() => {});
       return;
     }
-    fetch(`https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(query)}&format=json&limit=5`)
-      .then(r => r.json()).then(results => {
-        if (!results.length) {
-          suggestions.innerHTML = '<div class="suggest-item" style="color:var(--muted)">No results found</div>';
-          suggestions.style.display = 'block'; return;
-        }
-        suggestions.innerHTML = '';
-        results.forEach(r => {
-          const item = document.createElement('div');
-          item.className = 'suggest-item';
-          item.innerHTML = `${r.display_name.split(',')[0]}<div class="addr">${r.display_name}</div>`;
-          item.addEventListener('click', () => {
-            view.goTo({ center: [parseFloat(r.lon), parseFloat(r.lat)], zoom: 10 }, { duration: 800 }).catch(() => {});
-            searchInput.value = r.display_name.split(',')[0];
-            suggestions.style.display = 'none';
+    
+    clearTimeout(searchTimeout);
+    searchTimeout = setTimeout(() => {
+      fetch(`https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(query)}&format=json&limit=5`)
+        .then(r => r.json()).then(results => {
+          if (!results.length) {
+            suggestions.innerHTML = '<div class="suggest-item" style="color:var(--muted)">No results found</div>';
+            suggestions.style.display = 'block'; return;
+          }
+          suggestions.innerHTML = '';
+          results.forEach(r => {
+            const item = document.createElement('div');
+            item.className = 'suggest-item';
+            item.innerHTML = `${r.display_name.split(',')[0]}<div class="addr">${r.display_name}</div>`;
+            item.addEventListener('click', () => {
+              view.goTo({ center: [parseFloat(r.lon), parseFloat(r.lat)], zoom: 10 }, { duration: 800 }).catch(() => {});
+              searchInput.value = r.display_name.split(',')[0];
+              suggestions.style.display = 'none';
+            });
+            suggestions.appendChild(item);
           });
-          suggestions.appendChild(item);
+          suggestions.style.display = 'block';
+        }).catch(() => {
+          suggestions.innerHTML = '<div class="suggest-item" style="color:var(--danger)">Geocoding service unavailable</div>';
+          suggestions.style.display = 'block';
         });
-        suggestions.style.display = 'block';
-      }).catch(() => {
-        suggestions.innerHTML = '<div class="suggest-item" style="color:var(--danger)">Geocoding service unavailable</div>';
-        suggestions.style.display = 'block';
-      });
+    }, 500); // 500ms debounce
   }
 
   document.getElementById('searchBtn').addEventListener('click', () => performSearch(searchInput.value));
   searchInput.addEventListener('keydown', e => { if (e.key === 'Enter') performSearch(searchInput.value); });
   searchInput.addEventListener('input',   () => { if (!searchInput.value.trim()) suggestions.style.display = 'none'; });
-  document.addEventListener('click', e => {
-    if (!document.getElementById('searchPanel').contains(e.target)) suggestions.style.display = 'none';
-  });
+  document.addEventListener('click', e => { if (!document.getElementById('searchPanel').contains(e.target)) suggestions.style.display = 'none'; });
 
   // ═══════════════════════════════════════════════════════════════
   // REGULAR BOREHOLE UPLOAD
@@ -793,6 +790,8 @@ require([
   const fileInput = document.getElementById('fileInput');
   const statusEl  = document.getElementById('uploadStatus');
   const clearBtn  = document.getElementById('clearBoreholes');
+
+  function setStatus(el, msg, cls) { el.textContent = msg; el.className = 'upload-status ' + cls; }
 
   dropZone.addEventListener('click', () => fileInput.click());
   dropZone.addEventListener('dragover',  e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
@@ -804,15 +803,12 @@ require([
   fileInput.addEventListener('change', () => { if (fileInput.files[0]) handleFile(fileInput.files[0]); });
 
   clearBtn.addEventListener('click', () => {
-    boreholeLayer.removeAll();
-    boreholeData = {};
+    boreholeLayer.removeAll(); boreholeData = {};
     statusEl.textContent = 'No file loaded'; statusEl.className = 'upload-status info';
     clearBtn.style.display = 'none'; fileInput.value = '';
     document.getElementById('boreholeBadge').classList.remove('show');
     closePopup();
   });
-
-  function setStatus(el, msg, cls) { el.textContent = msg; el.className = 'upload-status ' + cls; }
 
   function handleFile(file) {
     setStatus(statusEl, 'Uploading…', 'info');
@@ -835,7 +831,7 @@ require([
   }
 
   // ═══════════════════════════════════════════════════════════════
-  // LOG PIPELINE  (ruleScript → borehole_3d_viz → 3D popup)
+  // LOG PIPELINE (SOCKET.IO & HTTP FALLBACK)
   // ═══════════════════════════════════════════════════════════════
   const logDropZone  = document.getElementById('logDropZone');
   const logFileInput = document.getElementById('logFileInput');
@@ -844,15 +840,52 @@ require([
   const logDownloadBtn  = document.getElementById('logDownloadBtn');
   const clearLogBtn     = document.getElementById('clearLogBoreholes');
 
+  let socket = null;
   let logPendingFile = null;
+  let currentJobId   = null;
 
-  // Check pipeline availability on load
+  if (typeof io !== 'undefined') {
+    socket = io({
+      transports: ['websocket', 'polling'],
+      reconnectionAttempts: 5,
+      reconnectionDelay: 2000,
+    });
+
+    socket.on('connect', () => { console.log('[Socket.IO] connected'); });
+    socket.on('disconnect', () => { console.warn('[Socket.IO] disconnected'); });
+    socket.on('connect_error', err => { console.error('[Socket.IO] error —', err.message); });
+
+    socket.on('job_progress', data => {
+      setStatus(logStatus, `⏳ ${data.progress}`, 'info');
+    });
+
+    socket.on('job_complete', data => {
+      logProcessBtn.disabled = false;
+      logBoreholeLayer.removeAll(); logBoreholeData = {};
+      plotBoreholes(data.boreholes, logBoreholeLayer, logBoreholeData, true);
+      setStatus(logStatus, `✓ ${data.count} boreholes processed — click orange dot for 3D`, 'ok');
+      logDownloadBtn.style.display = 'block';
+      clearLogBtn.style.display = 'block';
+      document.getElementById('logBadge').classList.add('show');
+      document.getElementById('pipelineBadge').style.display = '';
+      document.getElementById('btnLog').classList.add('log-active');
+      document.getElementById('logFlyout').classList.remove('open');
+      zoomToBoreholes(data.boreholes);
+    });
+
+    socket.on('job_error', data => {
+      logProcessBtn.disabled = false;
+      setStatus(logStatus, `⚠ ${data.error}`, 'err');
+    });
+  }
+
+  // Check pipeline availability once on page load
   fetch('/api/pipeline_status').then(r => r.json()).then(d => {
     if (d.available) {
       logProcessBtn.disabled = false;
-      setStatus(logStatus, '✓ Pipeline ready (ruleScript + borehole_3d_viz detected)', 'ok');
+      setStatus(logStatus, '✓ Pipeline ready', 'ok');
     } else {
-      setStatus(logStatus, '⚠ Pipeline modules not found: ' + (d.error || ''), 'err');
+      setStatus(logStatus, '⚠ Pipeline modules not found', 'err');
     }
   }).catch(() => {});
 
@@ -879,7 +912,7 @@ require([
   });
 
   function runLogPipeline(file) {
-    setStatus(logStatus, '⏳ Running pipeline… (colour → 3D)', 'info');
+    setStatus(logStatus, '⏳ Uploading file…', 'info');
     logProcessBtn.disabled = true;
     logDownloadBtn.style.display = 'none';
 
@@ -887,34 +920,56 @@ require([
     fd.append('file', file);
     fd.append('utm_zone', document.getElementById('logUtmZone').value || '43');
 
-    fetch('/api/process_log', { method:'POST', body:fd })
-      .then(r => r.json()).then(data => {
-        logProcessBtn.disabled = false;
-        if (data.error) { setStatus(logStatus, '⚠ ' + data.error, 'err'); return; }
+    fetch('/api/process_log', { method: 'POST', body: fd })
+      .then(r => r.json())
+      .then(data => {
+        if (data.error) {
+          logProcessBtn.disabled = false;
+          setStatus(logStatus, '⚠ ' + data.error, 'err');
+          return;
+        }
+        currentJobId = data.job_id;
 
-        logBoreholeLayer.removeAll(); logBoreholeData = {};
-        plotBoreholes(data.boreholes, logBoreholeLayer, logBoreholeData, true);
-
-        setStatus(logStatus,
-          `✓ ${data.count} boreholes processed — click any orange dot for 3D view`, 'ok');
-
-        logDownloadBtn.style.display = 'block';
-        clearLogBtn.style.display = 'block';
-        document.getElementById('logBadge').classList.add('show');
-        document.getElementById('pipelineBadge').style.display = '';
-        document.getElementById('btnLog').classList.add('log-active');
-        document.getElementById('logFlyout').classList.remove('open');
-
-        zoomToBoreholes(data.boreholes);
+        if (socket && socket.connected) {
+          socket.emit('join_job', { job_id: currentJobId });
+          setStatus(logStatus, '⏳ Pipeline queued — waiting for worker…', 'info');
+        } else {
+          setStatus(logStatus, '⏳ Processing (using HTTP polling)...', 'info');
+          
+          const pollInterval = setInterval(() => {
+            fetch(`/api/job_status/${currentJobId}`)
+              .then(res => res.json())
+              .then(job => {
+                if (job.status === 'completed') {
+                  clearInterval(pollInterval);
+                  logProcessBtn.disabled = false;
+                  logBoreholeLayer.removeAll(); logBoreholeData = {};
+                  plotBoreholes(job.data.boreholes, logBoreholeLayer, logBoreholeData, true);
+                  setStatus(logStatus, `✓ ${job.data.count} boreholes processed`, 'ok');
+                  logDownloadBtn.style.display = 'block';
+                  clearLogBtn.style.display = 'block';
+                  document.getElementById('logBadge').classList.add('show');
+                  document.getElementById('pipelineBadge').style.display = '';
+                  document.getElementById('btnLog').classList.add('log-active');
+                  document.getElementById('logFlyout').classList.remove('open');
+                  zoomToBoreholes(job.data.boreholes);
+                } else if (job.status === 'failed') {
+                  clearInterval(pollInterval);
+                  logProcessBtn.disabled = false;
+                  setStatus(logStatus, `⚠ ${job.error}`, 'err');
+                }
+              }).catch(e => console.error(e));
+          }, 2000);
+        }
       })
       .catch(() => {
         logProcessBtn.disabled = false;
-        setStatus(logStatus, '⚠ Request failed — is Flask running?', 'err');
+        setStatus(logStatus, '⚠ Upload failed — is Flask running?', 'err');
       });
   }
 
   logDownloadBtn.addEventListener('click', () => {
-    window.location.href = '/api/download_processed';
+    if (currentJobId) window.location.href = `/api/download_processed/${currentJobId}`;
   });
 
   clearLogBtn.addEventListener('click', () => {
@@ -924,9 +979,8 @@ require([
     document.getElementById('logBadge').classList.remove('show');
     document.getElementById('pipelineBadge').style.display = 'none';
     document.getElementById('btnLog').classList.remove('log-active');
-    logPendingFile = null;
-    logDropZone.querySelector('.dz-text').innerHTML =
-      'Drop <strong>logData.xlsx</strong><br>or click to browse';
+    logPendingFile = null; currentJobId = null;
+    logDropZone.querySelector('.dz-text').innerHTML = 'Drop <strong>logData.xlsx</strong><br>or click to browse';
     setStatus(logStatus, '', 'info');
     closePopup();
   });
@@ -934,8 +988,8 @@ require([
   // ═══════════════════════════════════════════════════════════════
   // SHARED: plot borehole markers
   // ═══════════════════════════════════════════════════════════════
-  let boreholeData    = {};   // id → record (regular)
-  let logBoreholeData = {};   // id → record (log pipeline)
+  let boreholeData    = {};   
+  let logBoreholeData = {};   
 
   function plotBoreholes(boreholes, layer, dataStore, isLog) {
     const glowColor = isLog ? [255, 159, 67, 40]  : [0, 212, 255, 35];
@@ -985,33 +1039,25 @@ require([
   // ═══════════════════════════════════════════════════════════════
   view.on('click', evt => {
     view.hitTest(evt).then(response => {
-      // Check log layer first (higher priority — orange markers)
       let hit = response.results.find(r =>
-        r.graphic && r.graphic.attributes &&
-        r.graphic.attributes.isLog === true &&
-        r.graphic.attributes.type  === 'core');
+        r.graphic && r.graphic.attributes && r.graphic.attributes.isLog === true && r.graphic.attributes.type === 'core');
 
       if (hit) {
         const bh = logBoreholeData[hit.graphic.attributes.boreholeId];
         if (bh) { showBoreholePopup(bh, evt.x, evt.y, true); return; }
       }
 
-      // Then regular layer
       hit = response.results.find(r =>
-        r.graphic && r.graphic.attributes &&
-        r.graphic.attributes.isLog !== true &&
-        r.graphic.attributes.type  === 'core');
+        r.graphic && r.graphic.attributes && r.graphic.attributes.isLog !== true && r.graphic.attributes.type === 'core');
 
       if (hit) {
         const bh = boreholeData[hit.graphic.attributes.boreholeId];
         if (bh) { showBoreholePopup(bh, evt.x, evt.y, false); return; }
       }
-
       closePopup();
     });
   });
 
-  // ── Panel open/close ─────────────────────────────────────────
   function closePopup() {
     document.getElementById('boreholePopup').classList.remove('show');
     document.getElementById('panelBackdrop').classList.remove('show');
@@ -1020,8 +1066,8 @@ require([
     document.getElementById('no3dPlaceholder').classList.remove('visible');
   }
 
-  // Close on backdrop click
   document.getElementById('panelBackdrop').addEventListener('click', closePopup);
+  document.getElementById('popupClose').addEventListener('click', closePopup);
 
   function showBoreholePopup(bh, screenX, screenY, isLog) {
     const popup       = document.getElementById('boreholePopup');
@@ -1033,15 +1079,11 @@ require([
     const placeholder = document.getElementById('no3dPlaceholder');
     const frame       = document.getElementById('borehole3dFrame');
 
-    // ── Header ──────────────────────────────────────────────
     header.className = 'popup-header' + (isLog ? ' log-header' : '');
     title.textContent = `BH-${bh.borehole_no}`;
     badge.style.display = (bh.has_3d && isLog) ? '' : 'none';
 
-    // ── Text info ────────────────────────────────────────────
     body.innerHTML = '';
-
-    // Core metrics as big cards
     const cards = [];
     if (bh.max_depth  != null) cards.push({ label:'Max Depth',   value: bh.max_depth + ' m',         accent: true });
     if (bh.water_depth)        cards.push({ label:'Water Depth', value: bh.water_depth,               accent: false });
@@ -1060,7 +1102,6 @@ require([
       body.innerHTML += `<div style="display:flex;gap:8px;margin-bottom:14px">${cardsHtml}</div>`;
     }
 
-    // Location section
     body.innerHTML += `<div class="info-section-title">📍 Location</div>`;
     const locFields = [
       ['Borehole No.', bh.borehole_no],
@@ -1070,25 +1111,18 @@ require([
     ];
     locFields.forEach(([k, v]) => {
       if (!v || v === 'undefined') return;
-      body.innerHTML += `<div class="popup-row">
-        <span class="popup-key">${k}</span>
-        <span class="popup-val">${v}</span></div>`;
+      body.innerHTML += `<div class="popup-row"><span class="popup-key">${k}</span><span class="popup-val">${v}</span></div>`;
     });
 
-    // Extra fields
-    const skip = new Set(['id','borehole_no','lat','lon','water_depth','coordinates_raw',
-                          'stratigraphy','has_3d','max_depth','layers_count']);
+    const skip = new Set(['id','borehole_no','lat','lon','water_depth','coordinates_raw','stratigraphy','has_3d','max_depth','layers_count','job_id']);
     const extras = Object.entries(bh).filter(([k,v]) => !skip.has(k) && v);
     if (extras.length) {
       body.innerHTML += `<div class="info-section-title">📋 Details</div>`;
       extras.forEach(([k,v]) => {
-        body.innerHTML += `<div class="popup-row">
-          <span class="popup-key">${k.replace(/_/g,' ')}</span>
-          <span class="popup-val">${v}</span></div>`;
+        body.innerHTML += `<div class="popup-row"><span class="popup-key">${k.replace(/_/g,' ')}</span><span class="popup-val">${v}</span></div>`;
       });
     }
 
-    // Corrected Stratigraphy Table with Data Attributes for matching
     if (bh.stratigraphy && bh.stratigraphy.length) {
       const sec = document.createElement('div');
       sec.className = 'strat-section';
@@ -1100,7 +1134,6 @@ require([
       
       bh.stratigraphy.forEach(l => {
         const tr = document.createElement('tr');
-        // CRITICAL: Numeric fields for matching 3D hover accurately 
         if (l.depth_top != null) tr.dataset.dtop = l.depth_top;
         if (l.depth_bot != null) tr.dataset.dbot = l.depth_bot;
         tr.innerHTML = `<td>${l.depth||'—'}</td><td>${l.description||'—'}</td>`;
@@ -1109,9 +1142,9 @@ require([
       tbl.appendChild(tb); sec.appendChild(tbl); body.appendChild(sec);
     }
 
-    // Handle 3D Iframe
-    if (bh.has_3d && isLog) {
-      frame.src = `/api/borehole_3d/${bh.id}`;
+    // Pass the unique Job ID to the iframe src
+    if (bh.has_3d && isLog && bh.job_id) {
+      frame.src = `/api/borehole_3d/${bh.job_id}/${bh.id}`;
       pane3d.classList.add('visible');
       placeholder.classList.remove('visible');
     } else {
@@ -1124,28 +1157,18 @@ require([
     document.getElementById('panelBackdrop').classList.add('show');
   }
 
-  document.getElementById('popupClose').addEventListener('click', closePopup);
-
-  // ═══════════════════════════════════════════════════════════════
-  // 3D IFRAME → PARENT: layer hover highlights strat table row
-  // ═══════════════════════════════════════════════════════════════
   window.addEventListener('message', evt => {
     if (!evt.data || !evt.data.type) return;
-
     const rows = document.querySelectorAll('#popupBody .strat-table tbody tr');
 
     if (evt.data.type === 'bhLayerHover') {
       const dtop = parseFloat(evt.data.depth_top);
       const dbot = parseFloat(evt.data.depth_bot);
-
       rows.forEach(tr => {
         tr.classList.remove('layer-highlight');
-        const rTop = parseFloat(tr.dataset.dtop);
-        const rBot = parseFloat(tr.dataset.dbot);
-        // Matching with small tolerance check for floating point numbers 
+        const rTop = parseFloat(tr.dataset.dtop), rBot = parseFloat(tr.dataset.dbot);
         if (!isNaN(rTop) && Math.abs(rTop - dtop) < 0.05 && Math.abs(rBot - dbot) < 0.05) {
           tr.classList.add('layer-highlight');
-          // Scroll highlighted row into view automatically 
           tr.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
         }
       });
@@ -1159,10 +1182,55 @@ require([
 });
 </script>
 
+
 <script>
-  // Lithosync branding — dynamic loading text
-  const loadSub = document.querySelector('.load-sub');
-  setTimeout(() => { if (loadSub) loadSub.innerText = "Synchronizing Lithology Data..."; }, 800);
+  // ─────────────────────────────────────────────────────────────────────────
+  // LOADING OVERLAY — GUARANTEED DISMISSAL
+  //
+  // This block is OUTSIDE the ArcGIS require() callback intentionally.
+  // If the Esri CDN (js.arcgis.com) never loads, require() is never called,
+  // so any timeout placed inside it would also never run.
+  // By putting everything here we guarantee the overlay always clears.
+  // ─────────────────────────────────────────────────────────────────────────
+
+  const _overlay  = document.getElementById('loadingOverlay');
+  const _lsEl     = document.querySelector('.load-sub');
+
+  // Expose a global so the require() block can cancel this if the map loads OK
+  window._dismissLoader = function(msg) {
+    clearTimeout(window._loaderHardTimer);
+    clearInterval(window._loaderMsgTimer);
+    if (msg && _lsEl && !_lsEl.style.color) _lsEl.innerText = msg;
+    setTimeout(() => _overlay.classList.add('fade'), 500);
+  };
+
+  // Hard fallback — fires even if ArcGIS CDN is unreachable (require never runs)
+  window._loaderHardTimer = setTimeout(() => {
+    clearInterval(window._loaderMsgTimer);
+    if (_lsEl) {
+      _lsEl.style.color = '#f0a500';
+      _lsEl.innerText   = 'Map unavailable (Esri CDN unreachable) — tools still work';
+    }
+    _overlay.classList.add('fade');
+  }, 10000);
+
+  // Animated status messages — stop automatically once overlay fades
+  const _msgs = [
+    'Initializing Lithosync GIS',
+    'Synchronizing Lithology Data…',
+    'Loading Basemap Layers…',
+    'Preparing 3D Engine…',
+    'Connecting to Esri CDN…',
+    'Almost there…',
+  ];
+  let _mi = 0;
+  window._loaderMsgTimer = setInterval(() => {
+    if (_overlay.classList.contains('fade')) {
+      clearInterval(window._loaderMsgTimer); return;
+    }
+    _mi = (_mi + 1) % _msgs.length;
+    if (_lsEl && !_lsEl.style.color) _lsEl.innerText = _msgs[_mi];
+  }, 1800);
 </script>
 </body>
 </html>

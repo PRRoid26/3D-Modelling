@@ -1,12 +1,8 @@
-"""
-Bathymetry Map Application — Python/Flask Backend
-► Run:   python app.py
-► Open:  http://localhost:5050
-"""
-
 from flask import Flask, render_template, request, jsonify, send_file
+from flask_socketio import SocketIO, join_room
 import pandas as pd
-import re, io, os, math, tempfile, sys
+import re, io, os, math, tempfile, sys, uuid
+from concurrent.futures import ThreadPoolExecutor
 
 BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
 TEMPLATES_DIR = os.path.join(BASE_DIR, 'templates')
@@ -14,6 +10,29 @@ os.makedirs(TEMPLATES_DIR, exist_ok=True)
 
 app = Flask(__name__, template_folder=TEMPLATES_DIR)
 app.config['MAX_CONTENT_LENGTH'] = 32 * 1024 * 1024   # 32 MB
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'lithosync-socketio-secret')
+
+# ── Socket.IO ──────────────────────────────────────────────────────────────────
+# async_mode='threading' is required when the app uses ThreadPoolExecutor.
+# It tells Flask-SocketIO to use the stdlib threading model, which means
+# socketio.emit() is safe to call from any thread (no event-loop conflicts).
+socketio = SocketIO(
+    app,
+    async_mode='threading',
+    cors_allowed_origins='*',      # tighten in production
+    logger=False,
+    engineio_logger=False,
+)
+
+# ── Concurrency & Scalability Setup ───────────────────────────────────────────
+JOBS_DIR = os.path.join(tempfile.gettempdir(), 'lithosync_jobs')
+os.makedirs(JOBS_DIR, exist_ok=True)
+
+# In-memory job tracker (status, lightweight copy of final payload)
+jobs_db: dict = {}
+
+# Background thread pool — 4 workers keeps CPU/IO load predictable
+worker_queue = ThreadPoolExecutor(max_workers=4)
 
 NOAA = 'https://gis.ngdc.noaa.gov/arcgis/rest/services'
 USGS = 'https://earthquake.usgs.gov/arcgis/rest/services'
@@ -37,8 +56,8 @@ PIPELINE_AVAILABLE = False
 PIPELINE_ERROR     = ""
 
 try:
-    from ruleScript import process_file as colour_file          # noqa: E402
-    from borehole_3d_viz import (                               # noqa: E402
+    from ruleScript import process_file as colour_file
+    from borehole_3d_viz import (
         load_boreholes, BUILTIN_INDEX,
         build_normaliser, build_traces, build_layout, build_html,
         depth_gridlines,
@@ -47,14 +66,11 @@ try:
 except ImportError as _ie:
     PIPELINE_ERROR = str(_ie)
 
-# ── In-memory 3D cache ────────────────────────────────────────────────────────
-_3d_html_cache: dict = {}        # { bh_id (int) → html_string }
-_processed_xlsx_path: str = ""   # path kept alive for /api/download_processed
-
 
 # ══════════════════════════════════════════════════════════════════════════════
-# UTM → WGS-84 (pure math, no external lib)
+# HELPERS — coordinate conversion & parsing
 # ══════════════════════════════════════════════════════════════════════════════
+
 def utm_to_latlon(easting, northing, zone_number, northern=True):
     k0 = 0.9996; a = 6378137.0; e = 0.00669438; e2 = e / (1 - e)
     x  = easting - 500000.0
@@ -81,26 +97,18 @@ def utm_to_latlon(easting, northing, zone_number, northern=True):
     return math.degrees(lat), math.degrees(lon) + lon_origin
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Coordinate parser  (UTM "m E, m N"  or  decimal-degree)
-# ══════════════════════════════════════════════════════════════════════════════
 def parse_coordinates(value, utm_zone=43):
-    if not value or (isinstance(value, float) and math.isnan(value)):
-        return None
+    if not value or (isinstance(value, float) and math.isnan(value)): return None
     val = str(value).strip()
 
     m = re.compile(r'([\d]+\.?\d*)\s*m?\s*E,?\s*([\d]+\.?\d*)\s*m?\s*N', re.I).search(val)
     if m:
         try:
             lat, lon = utm_to_latlon(float(m.group(1)), float(m.group(2)), utm_zone)
-            if -90 <= lat <= 90 and -180 <= lon <= 180:
-                return lat, lon
-        except Exception:
-            pass
+            if -90 <= lat <= 90 and -180 <= lon <= 180: return lat, lon
+        except Exception: pass
 
-    m = re.compile(
-        r'([+-]?\d+\.?\d*)\s*°?\s*([NSns]?)\s*[,\s/]+\s*([+-]?\d+\.?\d*)\s*°?\s*([EWew]?)'
-    ).search(val)
+    m = re.compile(r'([+-]?\d+\.?\d*)\s*°?\s*([NSns]?)\s*[,\s/]+\s*([+-]?\d+\.?\d*)\s*°?\s*([EWew]?)').search(val)
     if m:
         a, hns = float(m.group(1)), m.group(2).upper()
         b, hew = float(m.group(3)), m.group(4).upper()
@@ -111,17 +119,13 @@ def parse_coordinates(value, utm_zone=43):
     return None
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Regular borehole CSV/XLSX processor  (existing logic — unchanged)
-# ══════════════════════════════════════════════════════════════════════════════
 def process_borehole_df(df, utm_zone=43):
     df.columns = [str(c).strip() for c in df.columns]
 
     def find_col(keywords):
         for kw in keywords:
             for c in df.columns:
-                if kw in c.lower():
-                    return c
+                if kw in c.lower(): return c
         return None
 
     coord_col  = find_col(['co-ord', 'coord'])
@@ -131,33 +135,28 @@ def process_borehole_df(df, utm_zone=43):
     depth_col  = find_col(['depth'])
     wdepth_col = find_col(['water depth', 'waterdepth', 'water_depth'])
     srno_col   = find_col(['sr. no', 'sr.no', 'sr no', 'bh no', 'borehole no',
-                           'site no', 'well no', 'id', 'no.'])
+                            'site no', 'well no', 'id', 'no.'])
 
-    if depth_col and wdepth_col and depth_col == wdepth_col:
-        depth_col = None
+    if depth_col and wdepth_col and depth_col == wdepth_col: depth_col = None
     if depth_col and wdepth_col and 'water' in depth_col.lower():
         for c in df.columns:
             if 'depth' in c.lower() and 'water' not in c.lower():
-                depth_col = c
-                break
+                depth_col = c; break
 
     if not coord_col and not (lat_col and lon_col):
-        return None, (
-            f'No coordinate column found. Detected columns: {list(df.columns)}. '
-            'Expected "co-ord", "coord", or separate "lat"/"lon" columns.'
-        )
+        return None, f'No coordinate column found. Detected columns: {list(df.columns)}.'
 
-    records    = []
+    records = []
     current_bh = None
-    bh_index   = 0
+    bh_index = 0
 
     for _, row in df.iterrows():
         is_new = False
         if srno_col:
-            v      = row[srno_col]
+            v = row[srno_col]
             is_new = pd.notna(v) and str(v).strip() not in ('', 'nan')
         elif coord_col:
-            v      = row[coord_col]
+            v = row[coord_col]
             is_new = pd.notna(v) and str(v).strip() not in ('', 'nan')
         elif lat_col:
             is_new = pd.notna(row[lat_col])
@@ -169,575 +168,359 @@ def process_borehole_df(df, utm_zone=43):
                 parsed = parse_coordinates(str(row[coord_col]), utm_zone=utm_zone)
                 if parsed: lat, lon = parsed
             elif lat_col and lon_col:
-                try:
-                    lat = float(row[lat_col])
-                    lon = float(row[lon_col])
-                except Exception:
-                    pass
+                try: lat, lon = float(row[lat_col]), float(row[lon_col])
+                except Exception: pass
 
             if lat is None or lon is None:
-                current_bh = None
-                continue
+                current_bh = None; continue
 
-            bh_no = (str(int(float(row[srno_col])))
-                     if srno_col and pd.notna(row[srno_col]) else str(bh_index))
+            bh_no = str(int(float(row[srno_col]))) if srno_col and pd.notna(row[srno_col]) else str(bh_index)
             current_bh = {
-                'id':             bh_index - 1,
-                'borehole_no':    bh_no,
-                'lat':            round(lat, 6),
-                'lon':            round(lon, 6),
-                'coordinates_raw': (str(row[coord_col]).strip()
-                                    if coord_col and pd.notna(row[coord_col])
-                                    else f'{lat:.5f}, {lon:.5f}'),
-                'water_depth':    (str(row[wdepth_col]).strip()
-                                   if wdepth_col and pd.notna(row[wdepth_col]) else '—'),
-                'stratigraphy':   [],
-                'has_3d':         False,
+                'id': bh_index - 1, 'borehole_no': bh_no, 'lat': round(lat, 6), 'lon': round(lon, 6),
+                'coordinates_raw': str(row[coord_col]).strip() if coord_col and pd.notna(row[coord_col]) else f'{lat:.5f}, {lon:.5f}',
+                'water_depth': str(row[wdepth_col]).strip() if wdepth_col and pd.notna(row[wdepth_col]) else '—',
+                'stratigraphy': [], 'has_3d': False,
             }
-            structural = {srno_col, coord_col, lat_col, lon_col,
-                          wdepth_col, depth_col, strat_col, None}
+            structural = {srno_col, coord_col, lat_col, lon_col, wdepth_col, depth_col, strat_col, None}
             for c in df.columns:
                 if c not in structural and pd.notna(row[c]):
                     current_bh[c.lower().replace(' ', '_')] = str(row[c]).strip()
             records.append(current_bh)
 
         if current_bh is not None:
-            dv = str(row[depth_col]).strip()  if depth_col  and pd.notna(row[depth_col])  else ''
-            sv = str(row[strat_col]).strip()  if strat_col  and pd.notna(row[strat_col])  else ''
-            if dv or sv:
-                current_bh['stratigraphy'].append({'depth': dv, 'description': sv})
+            dv = str(row[depth_col]).strip() if depth_col and pd.notna(row[depth_col]) else ''
+            sv = str(row[strat_col]).strip() if strat_col and pd.notna(row[strat_col]) else ''
+            if dv or sv: current_bh['stratigraphy'].append({'depth': dv, 'description': sv})
 
-    if not records:
-        return None, 'No valid borehole records could be parsed from this file.'
+    if not records: return None, 'No valid borehole records could be parsed.'
     return records, None
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Helper: compact 3D HTML for a single borehole
-# ══════════════════════════════════════════════════════════════════════════════
-def _generate_bh_html(bh_id: int, bh_data: dict,
-                      global_nx, global_ny, hw: float = 9.5) -> str:
-    """
-    Self-contained Plotly HTML for ONE borehole.
-    - Cylindrical tube shape (monkey-patches box_mesh + pattern_traces_for_layer)
-    - Pure-black background
-    - Camera tuned to show the ENTIRE column top-to-bottom
-    - Soil Index legend filtered to only types present in this borehole
-    """
-    import json, math
-    import borehole_3d_viz as _bv
-
-    # ════════════════════════════════════════════════════════════════
-    # CYLINDER REPLACEMENTS for box_mesh + pattern_traces_for_layer
-    # ════════════════════════════════════════════════════════════════
-    N_SEG = 24   # circumference segments — more = smoother cylinder
-
-    def cylinder_mesh(cx, cy, z_top, z_bot, hw):
-        """Drop-in replacement for box_mesh: returns a smooth cylinder."""
-        r      = hw
-        angles = [2 * math.pi * k / N_SEG for k in range(N_SEG)]
-
-        # Vertices: top ring [0..N-1], bottom ring [N..2N-1],
-        #           top-cap centre [2N], bottom-cap centre [2N+1]
-        xs = [cx + r * math.cos(a) for a in angles] \
-           + [cx + r * math.cos(a) for a in angles] \
-           + [cx, cx]
-        ys = [cy + r * math.sin(a) for a in angles] \
-           + [cy + r * math.sin(a) for a in angles] \
-           + [cy, cy]
-        zs = [-z_top] * N_SEG + [-z_bot] * N_SEG + [-z_top, -z_bot]
-
-        ii, jj, kk = [], [], []
-        for seg in range(N_SEG):
-            nxt = (seg + 1) % N_SEG
-            # Side wall — two triangles per segment
-            ii += [seg,       nxt + N_SEG]
-            jj += [nxt,       seg  + N_SEG]
-            kk += [seg + N_SEG, nxt]
-        # Caps
-        top_c, bot_c = 2 * N_SEG, 2 * N_SEG + 1
-        for seg in range(N_SEG):
-            nxt = (seg + 1) % N_SEG
-            ii += [top_c,       bot_c]
-            jj += [nxt,         seg + N_SEG]
-            kk += [seg,         nxt + N_SEG]
-
-        return xs, ys, zs, ii, jj, kk
-
-    def cylinder_pattern_traces_for_layer(cx, cy, z_top, z_bot, hw, pat_type):
-        """Drop-in replacement for pattern_traces_for_layer: wraps patterns
-        around the cylinder surface parameterized by angle θ ∈ [0, 2π]."""
-        depth_range = z_bot - z_top
-        if depth_range <= 0:
-            return []
-
-        r      = hw
-        z_step = max(2.0, depth_range / max(int(depth_range / 2.5), 3))
-        z_vals = [z_top + z_step / 2 + k * z_step
-                  for k in range(int(depth_range / z_step) + 1)
-                  if z_top + z_step / 2 + k * z_step < z_bot]
-        ang_pts = [2 * math.pi * k / N_SEG for k in range(N_SEG)]
-
-        def surf(ang, z):
-            return cx + r * math.cos(ang), cy + r * math.sin(ang), -z
-
-        px, py, pz = [], [], []
-
-        if pat_type == "lightGray":       # Clay — horizontal dashes
-            for z in z_vals:
-                for i in range(0, N_SEG, 2):   # every other segment
-                    a_mid = ang_pts[i]
-                    x1, y1, z1 = surf(a_mid - 0.25, z)
-                    x2, y2, z2 = surf(a_mid + 0.25, z)
-                    px += [x1, x2, None]; py += [y1, y2, None]; pz += [z1, z2, None]
-
-        elif pat_type == "darkGray":      # Sand — dense dot grid
-            for z in z_vals:
-                for a in ang_pts:
-                    xp, yp, zp = surf(a, z)
-                    px.append(xp); py.append(yp); pz.append(zp)
-
-        elif pat_type == "gray0625":      # Silt — sparse dots
-            for z in z_vals[::2]:
-                for a in ang_pts[::2]:
-                    xp, yp, zp = surf(a, z)
-                    px.append(xp); py.append(yp); pz.append(zp)
-
-        elif pat_type == "lightUp":       # Calcarenite — diagonal /
-            n_diag = 10
-            for i in range(n_diag):
-                ang_off = (i / n_diag) * 2 * math.pi
-                for k in range(16):
-                    t   = k / 15
-                    ang = (ang_off + t * 2 * math.pi) % (2 * math.pi)
-                    z_v = z_top + t * depth_range
-                    xp, yp, zp = surf(ang, z_v)
-                    px.append(xp); py.append(yp); pz.append(zp)
-                px.append(None); py.append(None); pz.append(None)
-
-        elif pat_type == "lightTrellis":  # Sandstone — cross-hatch #
-            n_diag = 8
-            for i in range(n_diag):
-                ang_off = (i / n_diag) * 2 * math.pi
-                for direction in (+1, -1):
-                    for k in range(16):
-                        t   = k / 15
-                        ang = (ang_off + direction * t * 2 * math.pi) % (2 * math.pi)
-                        z_v = z_top + t * depth_range
-                        xp, yp, zp = surf(ang, z_v)
-                        px.append(xp); py.append(yp); pz.append(zp)
-                    px.append(None); py.append(None); pz.append(None)
-
-        if not px:
-            return []
-
-        is_line = None in px
-        trace = {
-            "type": "scatter3d", "x": px, "y": py, "z": pz,
-            "mode": "lines" if is_line else "markers",
-            "showlegend": False, "hoverinfo": "skip",
-        }
-        if is_line:
-            trace["line"]   = {"color": "rgba(0,0,0,0.80)", "width": 1.5}
-        else:
-            trace["marker"] = {"color": "rgba(0,0,0,0.85)", "size": 2.5,
-                               "symbol": "circle"}
-        return [trace]
-
-    # ── Monkey-patch borehole_3d_viz with cylinder functions ──────────────
-    _orig_box_mesh     = _bv.box_mesh
-    _orig_pat_traces   = _bv.pattern_traces_for_layer
-    _bv.box_mesh                  = cylinder_mesh
-    _bv.pattern_traces_for_layer  = cylinder_pattern_traces_for_layer
-
-    try:
-        single_bh = {bh_id: bh_data}
-        traces    = build_traces(single_bh, BUILTIN_INDEX, global_nx, global_ny, hw)
-        traces   += depth_gridlines(single_bh, global_nx, global_ny, hw)
-    finally:
-        # Always restore originals even if build_traces raises
-        _bv.box_mesh                 = _orig_box_mesh
-        _bv.pattern_traces_for_layer = _orig_pat_traces
-
-    # ── 1. Filter ALL Plotly legend swatches — we replace with custom HTML ───────
-    traces = [t for t in traces if not t.get('showlegend', False)]
-
-    # Texture → (bg_colour, label, SVG pattern definition, pattern fill ref)
-    # Each SVG pattern is 28×28px and matches the visual appearance of each soil type
-    TEXTURE_DEFS = {
-        "lightGray": {
-            "label": "Clay",
-            # Cylinder shows: evenly-spaced horizontal parallel lines
-            "svg_pattern": '''<pattern id="pi-lightGray" x="0" y="0" width="36" height="8" patternUnits="userSpaceOnUse">
-              <rect width="36" height="8" fill="white"/>
-              <line x1="0" y1="4" x2="36" y2="4" stroke="#222" stroke-width="1.4"/>
-            </pattern>''',
-        },
-        "darkGray": {
-            "label": "Sand",
-            # Cylinder shows: large scattered black dots, fairly sparse
-            "svg_pattern": '''<pattern id="pi-darkGray" x="0" y="0" width="10" height="10" patternUnits="userSpaceOnUse">
-              <rect width="10" height="10" fill="white"/>
-              <circle cx="2.5" cy="2.5" r="1.6" fill="#111"/>
-              <circle cx="7.5" cy="7.5" r="1.6" fill="#111"/>
-              <circle cx="7.5" cy="2.5" r="1.6" fill="#111"/>
-              <circle cx="2.5" cy="7.5" r="1.6" fill="#111"/>
-            </pattern>''',
-        },
-        "gray0625": {
-            "label": "Silt",
-            # Cylinder shows: sparse large dots, fewer than sand
-            "svg_pattern": '''<pattern id="pi-gray0625" x="0" y="0" width="14" height="14" patternUnits="userSpaceOnUse">
-              <rect width="14" height="14" fill="white"/>
-              <circle cx="3.5" cy="3.5" r="1.5" fill="#111"/>
-              <circle cx="10.5" cy="10.5" r="1.5" fill="#111"/>
-            </pattern>''',
-        },
-        "lightUp": {
-            "label": "Calcarenite",
-            # Cylinder shows: diagonal lines going up-right /
-            "svg_pattern": '''<pattern id="pi-lightUp" x="0" y="0" width="10" height="10" patternUnits="userSpaceOnUse">
-              <rect width="10" height="10" fill="white"/>
-              <line x1="0" y1="10" x2="10" y2="0" stroke="#222" stroke-width="1.4"/>
-              <line x1="-5" y1="10" x2="5"  y2="0" stroke="#222" stroke-width="1.4"/>
-              <line x1="5"  y1="10" x2="15" y2="0" stroke="#222" stroke-width="1.4"/>
-            </pattern>''',
-        },
-        "lightTrellis": {
-            "label": "Sandstone",
-            # Cylinder shows: cross-hatch, both diagonals clearly visible
-            "svg_pattern": '''<pattern id="pi-lightTrellis" x="0" y="0" width="10" height="10" patternUnits="userSpaceOnUse">
-              <rect width="10" height="10" fill="white"/>
-              <line x1="0"  y1="10" x2="10" y2="0"  stroke="#222" stroke-width="1.4"/>
-              <line x1="-5" y1="10" x2="5"  y2="0"  stroke="#222" stroke-width="1.4"/>
-              <line x1="5"  y1="10" x2="15" y2="0"  stroke="#222" stroke-width="1.4"/>
-              <line x1="0"  y1="0"  x2="10" y2="10" stroke="#222" stroke-width="1.4"/>
-              <line x1="-5" y1="0"  x2="5"  y2="10" stroke="#222" stroke-width="1.4"/>
-              <line x1="5"  y1="0"  x2="15" y2="10" stroke="#222" stroke-width="1.4"/>
-            </pattern>''',
-        },
-        "darkTrellis": {
-            "label": "Gravel",
-            # Grid: vertical + horizontal lines forming squares
-            "svg_pattern": '''<pattern id="pi-darkTrellis" x="0" y="0" width="10" height="10" patternUnits="userSpaceOnUse">
-              <rect width="10" height="10" fill="white"/>
-              <line x1="0" y1="5" x2="10" y2="5" stroke="#222" stroke-width="1.4"/>
-              <line x1="5" y1="0" x2="5" y2="10" stroke="#222" stroke-width="1.4"/>
-            </pattern>''',
-        },
-        "lightGrid": {
-            "label": "Limestone",
-            # Fine grid
-            "svg_pattern": '''<pattern id="pi-lightGrid" x="0" y="0" width="8" height="8" patternUnits="userSpaceOnUse">
-              <rect width="8" height="8" fill="white"/>
-              <line x1="0" y1="4" x2="8" y2="4" stroke="#333" stroke-width="0.9"/>
-              <line x1="4" y1="0" x2="4" y2="8" stroke="#333" stroke-width="0.9"/>
-            </pattern>''',
-        },
-        "lightDown": {
-            "label": "Shale",
-            # Diagonal lines going down-right \
-            "svg_pattern": '''<pattern id="pi-lightDown" x="0" y="0" width="10" height="10" patternUnits="userSpaceOnUse">
-              <rect width="10" height="10" fill="white"/>
-              <line x1="0"  y1="0"  x2="10" y2="10" stroke="#222" stroke-width="1.4"/>
-              <line x1="-5" y1="0"  x2="5"  y2="10" stroke="#222" stroke-width="1.4"/>
-              <line x1="5"  y1="0"  x2="15" y2="10" stroke="#222" stroke-width="1.4"/>
-            </pattern>''',
-        },
-        "solid": {
-            "label": "Massive",
-            "svg_pattern": '''<pattern id="pi-solid" x="0" y="0" width="4" height="4" patternUnits="userSpaceOnUse">
-              <rect width="4" height="4" fill="#aaa"/>
-            </pattern>''',
-        },
-    }
-
-    used_textures = {l["texture"] for l in bh_data["layers"] if l.get("texture")}
-    present_items = [(tex, TEXTURE_DEFS[tex]) for tex in TEXTURE_DEFS if tex in used_textures]
-
-    legend_rows = ""
-    for tex, d in present_items:
-        legend_rows += f'''
-        <div class="leg-row">
-          <svg width="48" height="24" style="flex-shrink:0;border-radius:3px;border:1px solid rgba(0,0,0,0.4)">
-            <defs>{d["svg_pattern"]}</defs>
-            <rect width="48" height="24" fill="url(#pi-{tex})"/>
-          </svg>
-          <span>{d["label"]}</span>
-        </div>'''
-
-    legend_html = f'''
-<div id="custom-legend">
-  <div class="leg-title">Soil Index</div>
-  {legend_rows}
-</div>'''
-
-    # ── 2. Tag ALL traces with depth customdata from their own z-geometry ────────
-    # Reading depths from the trace z-values directly is the only reliable approach.
-    # Order-based iteration breaks because water column, spine, and BH label traces
-    # interleave with layer traces unpredictably.
-    #
-    # Geometry rule (both cylinder and box):
-    #   - Mesh3d z-values are exactly [-depth_top]*N and [-depth_bot]*N
-    #     → depth_top = -max(z),  depth_bot = -min(z)
-    #   - Scatter3d pattern z-values span that same range (may include None)
-    #     → same formula after filtering None values
-    #
-    # We only tag traces that clearly belong to a stratigraphic layer:
-    #   mesh3d   → must have "Depth:" in hovertemplate (excludes water column)
-    #   scatter3d→ must not be a legend swatch, spine, or label
-    #              (we detect spine/label by hoverinfo=="skip" or showlegend==True)
-
-    def _z_to_depths(z_list):
-        """Extract (depth_top, depth_bot) from a z-coordinate list."""
-        real_z = [v for v in z_list if v is not None]
-        if not real_z:
-            return None, None
-        return round(-max(real_z), 4), round(-min(real_z), 4)
-
-    # Build a lookup: (depth_top, depth_bot) → layer dict
-    layer_by_depth = {
-        (round(l["depth_top"], 4), round(l["depth_bot"], 4)): l
-        for l in bh_data["layers"]
-    }
-
-    for t in traces:
-        if t.get("showlegend") or t.get("hoverinfo") == "skip":
-            continue   # legend swatch, spine, or gridline — skip
-
-        z_list = t.get("z", [])
-        dt, db = _z_to_depths(z_list)
-        if dt is None:
-            continue
-
-        # Match to nearest layer (tolerance 0.1 m handles float rounding)
-        matched_layer = None
-        for (lt, lb), lyr in layer_by_depth.items():
-            if abs(lt - dt) < 0.1 and abs(lb - db) < 0.1:
-                matched_layer = lyr
-                break
-
-        if matched_layer is None:
-            # Could be water column or BH label — suppress tooltip only
-            t["hovertemplate"] = "<extra></extra>"
-            continue
-
-        cd = [matched_layer["depth_top"], matched_layer["depth_bot"]]
-
-        if t["type"] == "mesh3d" and "Depth:" in t.get("hovertemplate", ""):
-            n_verts = len(t.get("x", []))
-            t["customdata"]    = [cd] * max(n_verts, 1)
-            t["hovertemplate"] = "<extra></extra>"
-        elif t["type"] == "scatter3d":
-            n_pts = len([v for v in t.get("x", []) if v is not None])
-            # For scatter3d the customdata must align with ALL points (including None)
-            n_all = len(t.get("x", []))
-            t["customdata"]    = [cd] * n_all
-            t["hovertemplate"] = "<extra></extra>"
-
-    # ── 3. Depth-axis ticks ───────────────────────────────────────────────────
-    max_depth = max((l["depth_bot"] for l in bh_data["layers"]), default=100)
-    step  = 25
-    tvals = list(range(0, -(int(max_depth) + step), -step))
-    ttxt  = [str(abs(v)) for v in tvals]
-
-    # ── 4. Pure-black layout ──────────────────────────────────────────────────
-    BLK       = "#000000"
-    GRID_COL  = "rgba(55,75,105,0.40)"
-    TICK_COL  = "rgba(155,165,180,0.75)"
-
-    layout = {
-        "autosize":      True,
-        "paper_bgcolor": BLK,
-        "margin":        {"l": 0, "r": 0, "t": 8, "b": 0},
-
-        "title": {"text": ""},
-
-        # Plotly legend disabled — replaced by custom SVG-pattern HTML legend
-        "showlegend": False,
-
-        "hoverlabel": {
-            "bgcolor":     "rgba(10,15,30,0.96)",
-            "bordercolor": "rgba(90,140,200,0.80)",
-            "font":        {"color": "white", "size": 12, "family": "Arial"},
-        },
-
-        "modebar": {
-            "bgcolor":     "rgba(0,0,0,0)",
-            "color":       "#888",
-            "activecolor": "white",
-            "orientation": "h",
-        },
-
-        "scene": {
-            "xaxis": {
-                "title":           {"text": "", "font": {"size": 0}},
-                "tickfont":        {"color": TICK_COL, "size": 7},
-                "gridcolor":       GRID_COL,
-                "zerolinecolor":   GRID_COL,
-                "backgroundcolor": BLK,
-                "showspikes":      False,
-            },
-            "yaxis": {
-                "title":           {"text": "", "font": {"size": 0}},
-                "tickfont":        {"color": TICK_COL, "size": 7},
-                "gridcolor":       GRID_COL,
-                "zerolinecolor":   GRID_COL,
-                "backgroundcolor": BLK,
-                "showspikes":      False,
-            },
-            "zaxis": {
-                "title":           {"text": "Depth (m)",
-                                    "font": {"color": TICK_COL, "size": 9}},
-                "tickfont":        {"color": TICK_COL, "size": 8},
-                "gridcolor":       GRID_COL,
-                "zerolinecolor":   "rgba(91,155,213,0.55)",
-                "backgroundcolor": BLK,
-                "tickvals":        tvals,
-                "ticktext":        ttxt,
-                "showspikes":      False,
-            },
-            "bgcolor": BLK,
-
-            # Equal x/y aspect = round cross-section, tall z for column
-            "aspectmode":  "manual",
-            "aspectratio": {"x": 0.45, "y": 0.45, "z": 2.10},
-
-            "domain": {"x": [0.0, 1.0], "y": [0.0, 1.0]},
-
-            # eye.x == eye.y  →  symmetric = round cylinder (not oval)
-            # eye.z low        →  side-on view so column appears tall, not top-down disc
-            "camera": {
-                "eye":    {"x": 1.20, "y": 1.20, "z": 0.28},
-                "up":     {"x": 0,    "y": 0,    "z": 1},
-                "center": {"x": 0,    "y": 0,    "z": -0.20},
-            },
-
-            "annotations": [],
-        },
-    }
-
-    traces_json = json.dumps(traces)
-    layout_json = json.dumps(layout)
-    config_json = json.dumps({
-        "displayModeBar": True,
-        "responsive":     True,
-        "scrollZoom":     True,
-        "modeBarButtonsToAdd":    ["resetCameraDefault3d"],
-        "modeBarButtonsToRemove": ["toImage"],
-        "displaylogo":    False,
-    })
-
-    cam_json = json.dumps({
-        "eye":    {"x": 1.20, "y": 1.20, "z": 0.28},
-        "up":     {"x": 0,    "y": 0,    "z": 1},
-        "center": {"x": 0,    "y": 0,    "z": -0.20},
-    })
+def _generate_bh_html(bh_id: int, bh_data: dict, global_nx, global_ny, hw: float = 9.5) -> str:
+    import json
+    layers = bh_data['layers']
+    water_depth = float(bh_data.get('water_depth', 0))
+    max_depth = max((l['depth_bot'] for l in layers), default=10)
+    js_layers = json.dumps([{
+        'depth_top': l['depth_top'], 'depth_bot': l['depth_bot'],
+        'strat': l.get('strat', ''), 'color': l.get('color', '#888888'),
+        'texture': l.get('texture', 'solid'),
+    } for l in layers])
 
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <style>
-    * {{ margin:0; padding:0; box-sizing:border-box }}
-    html, body {{ width:100%; height:100%; background:#000; overflow:hidden; }}
-    #plot {{ position:absolute; inset:0; width:100%; height:100%; background:#000; }}
-
-    /* ── Custom SVG-pattern legend ───────────────────────── */
-    #custom-legend {{
-      position:absolute; bottom:18px; right:16px; z-index:20;
-      background:rgba(0,0,0,0.88);
-      border:1px solid rgba(80,110,150,0.50);
-      border-radius:7px;
-      padding:10px 13px 10px 10px;
-      min-width:170px;
-      pointer-events:none;
-    }}
-    .leg-title {{
-      font-family:Arial,sans-serif; font-size:11px; font-weight:700;
-      color:#ccc; letter-spacing:.06em; text-transform:uppercase;
-      margin-bottom:7px; padding-bottom:5px;
-      border-bottom:1px solid rgba(255,255,255,0.12);
-    }}
-    .leg-row {{
-      display:flex; align-items:center; gap:8px;
-      margin-bottom:5px;
-    }}
-    .leg-row:last-child {{ margin-bottom:0; }}
-    .leg-row span {{
-      font-family:Arial,sans-serif; font-size:11px; color:#ccc;
-      white-space:nowrap;
-    }}
-  </style>
-  <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+*,*::before,*::after{{margin:0;padding:0;box-sizing:border-box}}
+html,body{{width:100%;height:100%;overflow:hidden;background:#05080c}}
+#container{{position:absolute;inset:0}}
+#tooltip{{position:absolute;pointer-events:none;display:none;background:rgba(4,8,15,0.97);border:1px solid #1a2840;border-left:3px solid #00c8a0;border-radius:0 7px 7px 0;padding:9px 13px;z-index:50;max-width:210px;font-family:'IBM Plex Mono',monospace;backdrop-filter:blur(10px);}}
+.tt-type{{font-size:12px;font-weight:600;margin-bottom:4px;color:#00c8a0}}
+.tt-depth{{font-size:9px;color:#3a5068;margin-bottom:5px}}
+.tt-desc{{font-size:10px;color:#c8d8e8;line-height:1.5}}
+#legend-overlay{{position:absolute;bottom:44px;left:8px;z-index:30;background:rgba(4,8,15,0.90);border:1px solid #1a2840;border-radius:7px;padding:8px 10px;font-family:'IBM Plex Mono',monospace;backdrop-filter:blur(8px);}}
+.leg-title{{font-size:8px;color:#3a5068;text-transform:uppercase;letter-spacing:1.5px;margin-bottom:6px;padding-bottom:4px;border-bottom:1px solid #1a2840;}}
+.leg-row{{display:flex;align-items:center;gap:7px;margin-bottom:4px}}
+.leg-row:last-child{{margin-bottom:0}}
+#controls-bar{{position:absolute;bottom:10px;left:50%;transform:translateX(-50%);background:rgba(4,8,15,0.78);border:1px solid #1a2840;border-radius:16px;padding:4px 14px;font-size:9px;color:#3a5068;letter-spacing:0.5px;display:flex;gap:12px;backdrop-filter:blur(4px);white-space:nowrap;font-family:monospace;}}
+.k{{background:#1a2840;color:#c8d8e8;padding:1px 5px;border-radius:3px;font-size:8px}}
+#bh-label{{position:absolute;top:10px;left:50%;transform:translateX(-50%);background:rgba(4,8,15,0.84);border:1px solid #1a2840;border-radius:6px;padding:4px 14px;font-size:11px;color:#00c8a0;font-weight:600;letter-spacing:1px;pointer-events:none;font-family:monospace;backdrop-filter:blur(4px);}}
+</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
 </head>
 <body>
-<div id="plot"></div>
-{legend_html}
+<div id="container"></div><div id="bh-label">BH-{bh_id}</div>
+<div id="tooltip"><div class="tt-type" id="tt-type"></div><div class="tt-depth" id="tt-depth"></div><div class="tt-desc" id="tt-desc"></div></div>
+<div id="legend-overlay"><div class="leg-title">Lithology Index</div><div id="leg-rows"></div></div>
+<div id="controls-bar"><span><span class="k">drag</span>&nbsp;Rotate</span><span><span class="k">scroll</span>&nbsp;Zoom</span><span><span class="k">hover</span>&nbsp;Inspect</span></div>
 <script>
-  const traces = {traces_json};
-  const layout = {layout_json};
-  const config = {config_json};
+var LAYERS = {js_layers}; var BH_ID = {bh_id}; var WATER_DEPTH = {water_depth}; var MAX_DEPTH = {max_depth};
+var TEX_PAT = {{lightGray:'diagonal',darkGray:'dots',gray0625:'dots_sparse',lightUp:'diagonal',lightDown:'diagonal_back',lightTrellis:'crosshatch',darkTrellis:'circles',lightGrid:'brick',lightHorizontal:'horizontal',darkHorizontal:'horizontal',lightVertical:'vertical',solid:'solid'}};
+var TEX_LBL = {{lightGray:'Clay',darkGray:'Sand',gray0625:'Silt',lightUp:'Calcarenite',lightDown:'Shale',lightTrellis:'Sandstone',darkTrellis:'Gravel',lightGrid:'Limestone',lightHorizontal:'Limestone',darkHorizontal:'Peat',lightVertical:'Silt',solid:'Massive'}};
 
-  Plotly.newPlot('plot', traces, layout, config).then(() => {{
-    return Plotly.relayout('plot', {{ 'scene.camera': {cam_json} }});
-  }}).then(() => {{
+function makePatternCanvas(texture, bgHex, S) {{
+  S = S || 256; var c = document.createElement('canvas'); c.width = S; c.height = S; var ctx = c.getContext('2d');
+  ctx.fillStyle = bgHex; ctx.fillRect(0, 0, S, S);
+  var pat = TEX_PAT[texture] || 'solid'; var lw = Math.max(3.0, S / 50);
+  ctx.strokeStyle = 'rgba(15, 15, 15, 0.95)'; ctx.fillStyle = 'rgba(15, 15, 15, 0.95)'; ctx.lineWidth = lw;
+  var step = S / 7.5;
+  if (pat === 'horizontal') {{ for(var y=step*0.5; y<S; y+=step) {{ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(S,y); ctx.stroke();}} }}
+  else if (pat === 'vertical') {{ for(var x=step*0.5; x<S; x+=step) {{ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,S); ctx.stroke();}} }}
+  else if (pat === 'diagonal') {{ for(var i=-S; i<S*2; i+=step) {{ctx.beginPath(); ctx.moveTo(i,0); ctx.lineTo(i+S,S); ctx.stroke();}} }}
+  else if (pat === 'diagonal_back') {{ for(var i=-S; i<S*2; i+=step) {{ctx.beginPath(); ctx.moveTo(i+S,0); ctx.lineTo(i,S); ctx.stroke();}} }}
+  else if (pat === 'dots') {{ var ds=step*1.1, r=S/25; for(var row=0; row*ds<S+step; row++) for(var col=(row%2)*0.5; col*ds<S; col++) {{ctx.beginPath(); ctx.arc(col*ds, row*ds, r, 0, Math.PI*2); ctx.fill();}} }}
+  else if (pat === 'dots_sparse') {{ var ds=step*1.9, r=S/30; for(var row=0; row*ds<S+step; row++) for(var col=(row%2)*0.5; col*ds<S; col++) {{ctx.beginPath(); ctx.arc(col*ds, row*ds, r, 0, Math.PI*2); ctx.fill();}} }}
+  else if (pat === 'crosshatch') {{ for(var i=-S; i<S*2; i+=step) {{ctx.beginPath(); ctx.moveTo(i,0); ctx.lineTo(i+S,S); ctx.stroke(); ctx.beginPath(); ctx.moveTo(i+S,0); ctx.lineTo(i,S); ctx.stroke();}} }}
+  else if (pat === 'circles') {{ var cs=step*1.5, cr=cs*0.35; for(var row=0; row*cs<S+step; row++) for(var col=(row%2)*0.5; col*cs<S; col++) {{ctx.beginPath(); ctx.arc(col*cs, row*cs, cr, 0, Math.PI*2); ctx.stroke();}} }}
+  else if (pat === 'brick') {{ var bh=step*1.3, bw=step*2.8; ctx.lineWidth = Math.max(3.0, S/60); for(var row=0; row*bh<S; row++) {{var y=row*bh; ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(S,y); ctx.stroke(); var off=(row%2)*(bw/2); for(var x2=off-bw; x2<S+bw; x2+=bw) {{ctx.beginPath(); ctx.moveTo(x2,y); ctx.lineTo(x2,y+bh); ctx.stroke();}}}} }}
+  return c;
+}}
 
-    /* ── Hover: relay layer info to parent via postMessage ── */
-    document.getElementById('plot').on('plotly_hover', function(data) {{
-      const pt = data.points && data.points[0];
-      if (!pt) return;
+var renderer = new THREE.WebGLRenderer({{ antialias: true, alpha: true }});
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2)); renderer.setClearColor(0x05080c);
+var cont = document.getElementById('container'); cont.appendChild(renderer.domElement);
 
-      // Plotly returns customdata as:
-      //   mesh3d   → pt.customdata = [depth_top, depth_bot]   (the vertex's entry)
-      //   scatter3d → pt.customdata = [depth_top, depth_bot]   (the point's entry)
-      // Both shapes are identical after our fix; just guard against nested arrays.
-      let cd = pt.customdata;
-      if (!cd) return;
-      if (Array.isArray(cd[0])) cd = cd[0];   // unwrap if accidentally nested
+var scene = new THREE.Scene(); var camera = new THREE.PerspectiveCamera(42, 1, 0.1, 3000);
+var Y_SCALE = 0.60; var SCALED_WATER = WATER_DEPTH * Y_SCALE; var SCALED_MAX = MAX_DEPTH * Y_SCALE;
+var TOTAL_H = SCALED_WATER + SCALED_MAX; var RADIUS = Math.max(3.0, TOTAL_H * 0.045);
+var MID_Y = ((SCALED_WATER - SCALED_MAX) / 2.0) - (TOTAL_H * 0.15);
+var camDist = Math.max(60, TOTAL_H * 2.3 + RADIUS * 5);
+var rotY = 0.6, rotX = 0.09; var autoSpin = true, dragging = false, prevM = {{ x: 0, y: 0 }};
 
-      const depth_top = parseFloat(cd[0]);
-      const depth_bot = parseFloat(cd[1]);
-      if (isNaN(depth_top) || isNaN(depth_bot)) return;
+function updateCamera() {{
+  camera.position.set(Math.sin(rotY)*Math.cos(rotX)*camDist, MID_Y+Math.sin(rotX)*camDist*0.55, Math.cos(rotY)*Math.cos(rotX)*camDist);
+  camera.lookAt(new THREE.Vector3(0, MID_Y, 0));
+}}
+updateCamera();
 
-      window.parent.postMessage({{
-        type: 'bhLayerHover',
-        depth_top,
-        depth_bot,
-      }}, '*');
-    }});
+scene.add(new THREE.AmbientLight(0xffffff, 0.45));
+var sun = new THREE.DirectionalLight(0xfff5e6, 1.3); sun.position.set(10, 15, 10); scene.add(sun);
+var fill = new THREE.DirectionalLight(0x88bbff, 0.6); fill.position.set(-10, 5, -10); scene.add(fill);
+var rim = new THREE.DirectionalLight(0x00e8b8, 0.35); rim.position.set(0, -SCALED_MAX - 5, -6); scene.add(rim);
+var gridSize = Math.max(80, TOTAL_H * 2.0); scene.add(new THREE.GridHelper(gridSize, 40, 0x0f1e30, 0x0c1622));
 
-    /* ── Unhover: clear highlight in parent ── */
-    document.getElementById('plot').on('plotly_unhover', function() {{
-      window.parent.postMessage({{ type: 'bhLayerUnhover' }}, '*');
-    }});
-  }});
+var layerMeshes = [];
+LAYERS.forEach(function(layer, idx) {{
+  var real_h = layer.depth_bot - layer.depth_top; if (real_h <= 0) return;
+  var h = real_h * Y_SCALE; var cy = -(layer.depth_top * Y_SCALE + h * 0.5);
+  var patC = makePatternCanvas(layer.texture, layer.color, 256);
+  var tex = new THREE.CanvasTexture(patC); tex.wrapS = THREE.RepeatWrapping; tex.wrapT = THREE.RepeatWrapping;
+  var repX = Math.max(3, Math.floor(RADIUS * 1.0)); var repY = Math.max(1, h / 5.0); tex.repeat.set(repX, repY);
+  tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  var mat = new THREE.MeshStandardMaterial({{map: tex, color: new THREE.Color(layer.color), roughness: 0.85, metalness: 0.05}});
+  var geo = new THREE.CylinderGeometry(RADIUS, RADIUS, h, 64, 1, false);
+  var mesh = new THREE.Mesh(geo, mat); mesh.position.y = cy; mesh.userData = {{ layer: layer }};
+  scene.add(mesh); layerMeshes.push(mesh);
+  if (idx < LAYERS.length - 1) {{ var ring = new THREE.Mesh(new THREE.TorusGeometry(RADIUS + 0.02, 0.08, 8, 64), new THREE.MeshBasicMaterial({{ color: 0x010406 }})); ring.rotation.x = Math.PI / 2; ring.position.y = -layer.depth_bot * Y_SCALE; scene.add(ring); }}
+  if (idx === 0) {{ var topCap = new THREE.Mesh(new THREE.CircleGeometry(RADIUS, 64), new THREE.MeshStandardMaterial({{ color: new THREE.Color(layer.color), roughness: 0.9 }})); topCap.rotation.x = -Math.PI / 2; topCap.position.y = 0; scene.add(topCap); }}
+  if (idx === LAYERS.length - 1) {{ var botCap = new THREE.Mesh(new THREE.CircleGeometry(RADIUS, 64), new THREE.MeshStandardMaterial({{ color: new THREE.Color(layer.color), roughness: 0.9 }})); botCap.rotation.x = Math.PI / 2; botCap.position.y = -layer.depth_bot * Y_SCALE; scene.add(botCap); }}
+}});
 
-  window.addEventListener('resize', () => Plotly.Plots.resize('plot'));
+if (WATER_DEPTH > 0) {{
+  var wMesh = new THREE.Mesh(new THREE.CylinderGeometry(RADIUS, RADIUS, SCALED_WATER, 64, 1, false), new THREE.MeshStandardMaterial({{color: 0x1166aa, transparent: true, opacity: 0.35, roughness: 0.2}})); wMesh.position.y = SCALED_WATER / 2; scene.add(wMesh);
+  var wRing = new THREE.Mesh(new THREE.TorusGeometry(RADIUS + 0.03, 0.06, 8, 64), new THREE.MeshBasicMaterial({{ color: 0x3388cc }})); wRing.rotation.x = Math.PI / 2; scene.add(wRing);
+}}
+
+function makeSprite(text, color) {{
+  var c = document.createElement('canvas'); c.width = 256; c.height = 64; var ctx = c.getContext('2d');
+  ctx.font = '600 24px monospace'; ctx.fillStyle = color || '#3e6a91'; ctx.fillText(text, 6, 42);
+  var sp = new THREE.Sprite(new THREE.SpriteMaterial({{map: new THREE.CanvasTexture(c), transparent: true, depthTest: false}})); sp.scale.set(3.5, 0.85, 1); return sp;
+}}
+var tickStep = MAX_DEPTH <= 25 ? 5 : MAX_DEPTH <= 80 ? 10 : 25;
+for (var d = 0; d <= MAX_DEPTH; d += tickStep) {{
+  var sp = makeSprite(d + 'm'); sp.position.set(RADIUS + 3.0, -d * Y_SCALE, 0); scene.add(sp);
+  var tg = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(RADIUS + 0.2, -d * Y_SCALE, 0), new THREE.Vector3(RADIUS + 1.8, -d * Y_SCALE, 0)]);
+  scene.add(new THREE.Line(tg, new THREE.LineBasicMaterial({{ color: 0x152235 }})));
+}}
+
+var seenTex = {{}}; var legRows = document.getElementById('leg-rows');
+LAYERS.forEach(function(layer) {{
+  var tex = layer.texture; if (seenTex[tex]) return; seenTex[tex] = true;
+  var sw = document.createElement('canvas'); sw.width = 34; sw.height = 16; var sc = sw.getContext('2d');
+  var pat = sc.createPattern(makePatternCanvas(tex, layer.color, 64), 'repeat'); sc.fillStyle = pat; sc.fillRect(0, 0, 34, 16); sw.style.cssText = 'width:34px;height:16px;border-radius:2px;border:1px solid rgba(255,255,255,0.15);flex-shrink:0';
+  var lbl = document.createElement('span'); lbl.style.cssText = 'font-size:9px;color:#c8d8e8;font-family:monospace'; lbl.textContent = TEX_LBL[tex] || tex;
+  var row = document.createElement('div'); row.className = 'leg-row'; row.appendChild(sw); row.appendChild(lbl); legRows.appendChild(row);
+}});
+
+function onResize() {{ var w = cont.clientWidth, h = cont.clientHeight; renderer.setSize(w, h, false); camera.aspect = w / h; camera.updateProjectionMatrix(); }}
+onResize(); window.addEventListener('resize', onResize);
+var cvs = renderer.domElement; cvs.style.cursor = 'grab';
+cvs.addEventListener('mousedown', function(e) {{ dragging = true; autoSpin = false; prevM = {{ x: e.clientX, y: e.clientY }}; cvs.style.cursor = 'grabbing'; }});
+window.addEventListener('mousemove', function(e) {{ if (!dragging) return; rotY += (e.clientX - prevM.x) * 0.007; rotX = Math.max(-0.35, Math.min(0.32, rotX + (e.clientY - prevM.y) * 0.004)); prevM = {{ x: e.clientX, y: e.clientY }}; updateCamera(); }});
+window.addEventListener('mouseup', function() {{ dragging = false; cvs.style.cursor = 'grab'; }});
+cvs.addEventListener('wheel', function(e) {{ camDist = Math.max(10, Math.min(1500, camDist + e.deltaY * 0.05)); updateCamera(); e.preventDefault(); }}, {{ passive: false }});
+
+var raycaster = new THREE.Raycaster(); var mp = new THREE.Vector2(); var tooltip = document.getElementById('tooltip'); var lastLayer = null;
+cvs.addEventListener('mousemove', function(e) {{
+  var rect = cvs.getBoundingClientRect(); mp.x = ((e.clientX - rect.left) / rect.width) * 2 - 1; mp.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+  raycaster.setFromCamera(mp, camera); var hits = raycaster.intersectObjects(layerMeshes);
+  if (hits.length > 0) {{
+    var layer = hits[0].object.userData.layer;
+    if (lastLayer !== layer) {{ lastLayer = layer; window.parent.postMessage({{ type: 'bhLayerHover', depth_top: layer.depth_top, depth_bot: layer.depth_bot }}, '*'); }}
+    var thick = (layer.depth_bot - layer.depth_top).toFixed(1); tooltip.style.display = 'block'; tooltip.style.left = Math.min(e.clientX - rect.left + 14, rect.width - 224) + 'px'; tooltip.style.top = Math.max(e.clientY - rect.top - 10, 8) + 'px';
+    document.getElementById('tt-type').textContent = TEX_LBL[layer.texture] || layer.texture; document.getElementById('tt-depth').textContent = layer.depth_top.toFixed(1) + ' \u2013 ' + layer.depth_bot.toFixed(1) + ' m (' + thick + ' m thick)'; document.getElementById('tt-desc').textContent = layer.strat || '\u2014';
+  }} else {{
+    if (lastLayer !== null) {{ lastLayer = null; tooltip.style.display = 'none'; window.parent.postMessage({{ type: 'bhLayerUnhover' }}, '*'); }}
+  }}
+}});
+cvs.addEventListener('mouseleave', function() {{ tooltip.style.display = 'none'; lastLayer = null; window.parent.postMessage({{ type: 'bhLayerUnhover' }}, '*'); }});
+function animate() {{ requestAnimationFrame(animate); if (autoSpin && !dragging) {{ rotY += 0.004; updateCamera(); }} renderer.render(scene, camera); }}
+animate();
 </script>
 </body>
 </html>"""
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Flask routes
+# SOCKET.IO — event handlers
+# ══════════════════════════════════════════════════════════════════════════════
+
+@socketio.on('connect')
+def on_connect():
+    """Client connected — no action needed; rooms are joined per-job."""
+    pass
+
+
+@socketio.on('disconnect')
+def on_disconnect():
+    """Client disconnected — Flask-SocketIO handles room cleanup automatically."""
+    pass
+
+
+@socketio.on('join_job')
+def on_join_job(data):
+    """
+    Client emits {'job_id': '<uuid>'} right after the HTTP POST returns.
+    We add the socket to that room so subsequent emits reach only this client.
+    If the job already finished before the client joined, we replay the final
+    status from jobs_db immediately.
+    """
+    job_id = data.get('job_id', '')
+    if not job_id:
+        return
+
+    join_room(job_id)
+
+    # Replay final state if the worker finished before the join arrived
+    job = jobs_db.get(job_id)
+    if job:
+        if job['status'] == 'completed':
+            socketio.emit('job_complete', job['data'], to=job_id)
+        elif job['status'] == 'failed':
+            socketio.emit('job_error', {'error': job.get('error', 'Unknown error')}, to=job_id)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BACKGROUND PIPELINE — emits Socket.IO events from the worker thread
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _emit_progress(job_id: str, message: str):
+    """
+    Thread-safe helper.
+    Flask-SocketIO with async_mode='threading' allows emit() from any thread,
+    but we wrap in app_context() as a safety net for any Flask internals that
+    might be touched indirectly (e.g. g, current_app references in helpers).
+    """
+    with app.app_context():
+        socketio.emit(
+            'job_progress',
+            {'progress': message},
+            to=job_id,
+            namespace='/',
+        )
+
+
+def _run_pipeline_task(job_id: str, input_path: str, utm_zone: int):
+    """
+    Background worker.  Runs in a ThreadPoolExecutor thread.
+    All Socket.IO emits go through _emit_progress() to stay thread-safe.
+    """
+    try:
+        job_dir     = os.path.join(JOBS_DIR, job_id)
+        output_path = os.path.join(job_dir, 'my_output.xlsx')
+        html_dir    = os.path.join(job_dir, 'html')
+        os.makedirs(html_dir, exist_ok=True)
+
+        # ── Step 1 ───────────────────────────────────────────────
+        _emit_progress(job_id, 'Auto-colouring stratigraphy…')
+        colour_file(input_path, output_path)
+
+        # ── Step 2 ───────────────────────────────────────────────
+        _emit_progress(job_id, 'Parsing borehole log…')
+        boreholes = load_boreholes(output_path)
+        if not boreholes:
+            raise ValueError('No valid borehole records found in log file.')
+
+        nx_fn, ny_fn = build_normaliser(boreholes)
+        total = len(boreholes)
+
+        # ── Step 3 ───────────────────────────────────────────────
+        _emit_progress(job_id, f'Generating 3D models (0 / {total})…')
+        for idx, (bh_id, bh_data) in enumerate(boreholes.items(), 1):
+            html_str = _generate_bh_html(bh_id, bh_data, nx_fn, ny_fn)
+            with open(os.path.join(html_dir, f"{bh_id}.html"), 'w', encoding='utf-8') as f:
+                f.write(html_str)
+            # Throttle progress events: emit every 10 boreholes or at the end
+            if idx % 10 == 0 or idx == total:
+                _emit_progress(job_id, f'Generating 3D models ({idx} / {total})…')
+
+        # ── Step 4 ───────────────────────────────────────────────
+        _emit_progress(job_id, 'Finalising map data…')
+        records = []
+        for bh_id, bh in boreholes.items():
+            try: lat, lon = utm_to_latlon(bh['x'], bh['y'], utm_zone, northern=True)
+            except Exception: continue
+            if not (-90 <= lat <= 90 and -180 <= lon <= 180): continue
+
+            max_depth = max((l['depth_bot'] for l in bh['layers']), default=0)
+            records.append({
+                'id': bh_id, 'borehole_no': str(bh_id),
+                'lat': round(lat, 6), 'lon': round(lon, 6),
+                'coordinates_raw': f"{bh['x']:.1f} m E, {bh['y']:.1f} m N",
+                'water_depth': f"{bh['water_depth']} m",
+                'max_depth': max_depth,
+                'layers_count': len(bh['layers']),
+                'has_3d': True,
+                'job_id': job_id,
+                'stratigraphy': [
+                    {
+                        'depth': f"{l['depth_top']}–{l['depth_bot']} m",
+                        'depth_top': l['depth_top'],
+                        'depth_bot': l['depth_bot'],
+                        'description': l['strat'],
+                    }
+                    for l in bh['layers']
+                ],
+            })
+
+        if not records:
+            raise ValueError('Coordinates could not be converted to lat/lon — verify UTM zone.')
+
+        payload = {'count': len(records), 'boreholes': records}
+
+        # Persist result so late-joining clients can still read it via on_join_job
+        jobs_db[job_id]['status'] = 'completed'
+        jobs_db[job_id]['data']   = payload
+
+        # ── Broadcast completion ──────────────────────────────────
+        with app.app_context():
+            socketio.emit('job_complete', payload, to=job_id, namespace='/')
+
+    except Exception as exc:
+        jobs_db[job_id]['status'] = 'failed'
+        jobs_db[job_id]['error']  = str(exc)
+        with app.app_context():
+            socketio.emit(
+                'job_error',
+                {'error': str(exc)},
+                to=job_id,
+                namespace='/',
+            )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HTTP ROUTES
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.route('/')
 def index():
     return render_template('index.html', layers=LAYER_CATALOG)
 
+
 @app.route('/api/layers')
 def get_layers():
     return jsonify(LAYER_CATALOG)
 
+
 @app.route('/api/pipeline_status')
 def pipeline_status():
-    return jsonify({'available': PIPELINE_AVAILABLE,
-                    'error':     PIPELINE_ERROR if not PIPELINE_AVAILABLE else ''})
+    return jsonify({
+        'available': PIPELINE_AVAILABLE,
+        'error':     PIPELINE_ERROR if not PIPELINE_AVAILABLE else '',
+    })
 
-# ── Regular borehole upload ────────────────────────────────────────────────────
+
 @app.route('/api/upload_boreholes', methods=['POST'])
 def upload_boreholes():
     if 'file' not in request.files:
@@ -746,7 +529,7 @@ def upload_boreholes():
     if not file.filename:
         return jsonify({'error': 'No file selected'}), 400
 
-    raw      = file.read()
+    raw = file.read()
     filename = file.filename.lower()
     try:
         if filename.endswith('.csv'):
@@ -758,124 +541,90 @@ def upload_boreholes():
     except Exception as exc:
         return jsonify({'error': f'Could not parse file: {exc}'}), 400
 
-    utm_zone        = int(request.form.get('utm_zone', 43))
-    records, error  = process_borehole_df(df, utm_zone=utm_zone)
+    utm_zone = int(request.form.get('utm_zone', 43))
+    records, error = process_borehole_df(df, utm_zone=utm_zone)
     if error:
         return jsonify({'error': error}), 400
     return jsonify({'count': len(records), 'boreholes': records})
 
 
-# ── Log data pipeline  (colour → 3D generation) ───────────────────────────────
 @app.route('/api/process_log', methods=['POST'])
 def process_log():
-    global _3d_html_cache, _processed_xlsx_path
-
+    """
+    Accepts the log Excel file, creates an isolated job workspace,
+    queues the pipeline in the thread pool, and immediately returns
+    the job_id.  The client then joins the Socket.IO room for that
+    job_id and receives real-time progress / completion events.
+    """
     if not PIPELINE_AVAILABLE:
-        return jsonify({'error': (
-            'Pipeline modules not found next to app.py. '
-            'Place ruleScript.py and borehole_3d_viz.py in the same folder. '
-            f'Detail: {PIPELINE_ERROR}'
-        )}), 500
-
+        return jsonify({'error': 'Pipeline modules missing.'}), 500
     if 'file' not in request.files:
         return jsonify({'error': 'No file in request'}), 400
+
     file = request.files['file']
-    if not file.filename:
-        return jsonify({'error': 'No file selected'}), 400
     if not file.filename.lower().endswith(('.xlsx', '.xls')):
         return jsonify({'error': 'Please upload an Excel file (.xlsx / .xls)'}), 400
 
-    utm_zone    = int(request.form.get('utm_zone', 43))
-    tmp_dir     = tempfile.mkdtemp(prefix='bhlog_')
-    input_path  = os.path.join(tmp_dir, 'logData.xlsx')
-    output_path = os.path.join(tmp_dir, 'my_output.xlsx')
+    utm_zone = int(request.form.get('utm_zone', 43))
 
-    try:
-        file.save(input_path)
+    # Isolated workspace per job
+    job_id   = str(uuid.uuid4())
+    job_dir  = os.path.join(JOBS_DIR, job_id)
+    os.makedirs(job_dir, exist_ok=True)
 
-        # Step 1 — auto-colour + texture assignment
-        colour_file(input_path, output_path)
+    input_path = os.path.join(job_dir, 'input.xlsx')
+    file.save(input_path)
 
-        # Step 2 — load all boreholes from coloured workbook
-        boreholes = load_boreholes(output_path)
-        if not boreholes:
-            return jsonify({'error': 'No valid borehole records found in log file.'}), 400
+    # Initialise job record
+    jobs_db[job_id] = {'status': 'processing', 'progress': 'Queued…'}
 
-        # Step 3 — global normaliser keeps relative positions correct
-        nx_fn, ny_fn = build_normaliser(boreholes)
+    # Fire-and-forget in the thread pool
+    worker_queue.submit(_run_pipeline_task, job_id, input_path, utm_zone)
 
-        # Step 4 — generate compact 3D HTML for each borehole
-        _3d_html_cache = {}
-        for bh_id, bh_data in boreholes.items():
-            _3d_html_cache[bh_id] = _generate_bh_html(bh_id, bh_data, nx_fn, ny_fn)
-
-        # Step 5 — convert UTM coords → lat/lon for ArcGIS map
-        _processed_xlsx_path = output_path     # keep for download endpoint
-        records = []
-        for bh_id, bh in boreholes.items():
-            try:
-                lat, lon = utm_to_latlon(bh['x'], bh['y'], utm_zone, northern=True)
-            except Exception:
-                continue
-            if not (-90 <= lat <= 90 and -180 <= lon <= 180):
-                continue
-
-            max_depth = max((l['depth_bot'] for l in bh['layers']), default=0)
-            records.append({
-                'id':             bh_id,
-                'borehole_no':    str(bh_id),
-                'lat':            round(lat, 6),
-                'lon':            round(lon, 6),
-                'coordinates_raw': f"{bh['x']:.1f} m E, {bh['y']:.1f} m N",
-                'water_depth':    f"{bh['water_depth']} m",
-                'max_depth':      max_depth,
-                'layers_count':   len(bh['layers']),
-                'has_3d':         True,
-                'stratigraphy': [
-                    {'depth': f"{l['depth_top']}–{l['depth_bot']} m",
-                     'depth_top': l['depth_top'],
-                     'depth_bot': l['depth_bot'],
-                     'description': l['strat']}
-                    for l in bh['layers']
-                ],
-            })
-
-        if not records:
-            return jsonify({
-                'error': 'Coordinates could not be converted to lat/lon — verify UTM zone.'
-            }), 400
-
-        return jsonify({'count': len(records), 'boreholes': records,
-                        'pipeline': 'log_processed'})
-
-    except Exception as exc:
-        return jsonify({'error': str(exc)}), 500
+    # Return immediately — client will subscribe via Socket.IO
+    return jsonify({'job_id': job_id, 'status': 'processing'})
 
 
-# ── Serve per-borehole 3D iframe ──────────────────────────────────────────────
-@app.route('/api/borehole_3d/<int:bh_id>')
-def borehole_3d(bh_id):
-    html = _3d_html_cache.get(bh_id)
-    if html is None:
-        return ('<html><body style="background:#0d1117;color:#aaa;'
-                'font-family:sans-serif;padding:30px;text-align:center">'
-                '<h3>3D view not available</h3>'
-                '<p>Run the Log Pipeline first.</p></body></html>'), 404
-    return html, 200, {'Content-Type': 'text/html; charset=utf-8'}
+# Kept as a lightweight fallback for clients that cannot use WebSockets
+@app.route('/api/job_status/<job_id>')
+def job_status(job_id):
+    job = jobs_db.get(job_id)
+    if not job:
+        return jsonify({'error': 'Job not found'}), 404
+    return jsonify(job)
 
 
-# ── Download processed (coloured) Excel ───────────────────────────────────────
-@app.route('/api/download_processed')
-def download_processed():
-    if not _processed_xlsx_path or not os.path.exists(_processed_xlsx_path):
-        return jsonify({'error': 'No processed file — run the pipeline first.'}), 404
+@app.route('/api/borehole_3d/<job_id>/<int:bh_id>')
+def borehole_3d(job_id, bh_id):
+    filepath = os.path.join(JOBS_DIR, job_id, 'html', f"{bh_id}.html")
+    if os.path.exists(filepath):
+        return send_file(filepath, mimetype='text/html')
+    return (
+        '<html><body style="background:#0d1117;color:#aaa;'
+        'font-family:sans-serif;padding:30px;text-align:center">'
+        '<h3>3D view not found</h3>'
+        '<p>Cache may have expired. Please re-run the pipeline.</p></body></html>'
+    ), 404
+
+
+@app.route('/api/download_processed/<job_id>')
+def download_processed(job_id):
+    filepath = os.path.join(JOBS_DIR, job_id, 'my_output.xlsx')
+    if not os.path.exists(filepath):
+        return jsonify({'error': 'Processed file not found. Please run the pipeline again.'}), 404
     return send_file(
-        _processed_xlsx_path,
+        filepath,
         as_attachment=True,
         download_name='my_output.xlsx',
         mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
     )
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# ENTRY POINT
+# ══════════════════════════════════════════════════════════════════════════════
+
 if __name__ == '__main__':
-    app.run(debug=True, port=5050)
+    # Use socketio.run() — it wraps Flask's development server with the
+    # correct WSGI + WebSocket transport (eventlet / threading / gevent).
+    socketio.run(app, debug=True, port=5050, allow_unsafe_werkzeug=True)
