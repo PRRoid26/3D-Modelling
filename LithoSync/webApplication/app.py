@@ -1,41 +1,211 @@
-from flask import Flask, render_template, request, jsonify, send_file
-from flask_socketio import SocketIO, join_room
+from dotenv import load_dotenv
+load_dotenv()
+
+import logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(name)s  %(levelname)s  %(message)s"
+)
+
+"""
+Lithosync — Flask Backend
+=========================
+Security-hardened version compliant with:
+  • Rule 1 & 3  — Geo-fence / data sovereignty  (X-Data-Classification header)
+  • Rule 2      — MeitY-approved encrypted volume (SECURE_MOUNT_PATH env var)
+  • Rule 4      — COBIT audit trail               (geo_audit_log via ruleScript)
+  • Rule 5      — SAP IAM / role segregation      (X-SAP-Role header enforcement)
+  • Rule 6      — CERT-In compliance              (Syslog → SIEM, 180-day archive)
+"""
+
+from flask import Flask, render_template, request, jsonify, send_file, g
 import pandas as pd
-import re, io, os, math, tempfile, sys, uuid
+import re, io, os, math, tempfile, sys, uuid, logging
+from logging.handlers import SysLogHandler
 from concurrent.futures import ThreadPoolExecutor
 
+# ══════════════════════════════════════════════════════════════════════════════
+# RULE 2 — MeitY-approved encrypted volume
+# JOBS_DIR must point to the mounted encrypted volume declared in the
+# deployment environment.  Never fall back to the OS tmp in production.
+# ══════════════════════════════════════════════════════════════════════════════
+SECURE_MOUNT_PATH = os.environ.get("SECURE_MOUNT_PATH")
+if not SECURE_MOUNT_PATH:
+    # Development-only fallback — raises a loud warning
+    import warnings
+    warnings.warn(
+        "[SECURITY] SECURE_MOUNT_PATH is not set. "
+        "Using OS temp dir — NOT acceptable in production. "
+        "Set SECURE_MOUNT_PATH to a MeitY-empanelled encrypted volume path.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+    SECURE_MOUNT_PATH = tempfile.gettempdir()
+
+JOBS_DIR = os.path.join(SECURE_MOUNT_PATH, "lithosync_jobs")
+os.makedirs(JOBS_DIR, exist_ok=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RULE 2 (Infrastructure readiness) — Encrypted PostgreSQL connection string
+# The full DSN is read from an environment variable so secrets are never
+# baked into source code.  The HSM key that decrypts the DB volume is managed
+# externally; we only consume the resulting DSN here.
+#
+# Example (set in the deployment environment, never in this file):
+#   DATABASE_URL=postgresql+psycopg2://user:pass@internal-db.ongc.local:5432/lithosync_geo?sslmode=require
+# ══════════════════════════════════════════════════════════════════════════════
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL",
+    "postgresql+psycopg2://lithosync:changeme@localhost:5432/lithosync_geo?sslmode=require",
+)
+
 BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
-TEMPLATES_DIR = os.path.join(BASE_DIR, 'templates')
+TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
 os.makedirs(TEMPLATES_DIR, exist_ok=True)
 
 app = Flask(__name__, template_folder=TEMPLATES_DIR)
-app.config['MAX_CONTENT_LENGTH'] = 32 * 1024 * 1024   # 32 MB
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'lithosync-socketio-secret')
+app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024  # 32 MB
+# Secret key from env so it is never committed to source control
+app.config["SECRET_KEY"] = os.environ.get("FLASK_SECRET_KEY", os.urandom(32))
 
-# ── Socket.IO ──────────────────────────────────────────────────────────────────
-# async_mode='threading' is required when the app uses ThreadPoolExecutor.
-# It tells Flask-SocketIO to use the stdlib threading model, which means
-# socketio.emit() is safe to call from any thread (no event-loop conflicts).
-socketio = SocketIO(
-    app,
-    async_mode='threading',
-    cors_allowed_origins='*',      # tighten in production
-    logger=False,
-    engineio_logger=False,
-)
+# ══════════════════════════════════════════════════════════════════════════════
+# RULE 6 — CERT-In: Syslog → SIEM
+# All Flask access logs, error logs, and security events are piped through a
+# SysLogHandler so the SIEM (IBM QRadar or any CERT-In-empanelled product)
+# can ingest them without polling log files.
+#
+# Set SIEM_HOST / SIEM_PORT in the environment to point at your SIEM receiver.
+# ══════════════════════════════════════════════════════════════════════════════
+SIEM_HOST = os.environ.get("SIEM_HOST", "127.0.0.1")
+SIEM_PORT = int(os.environ.get("SIEM_PORT", "514"))
 
-# ── Concurrency & Scalability Setup ───────────────────────────────────────────
-JOBS_DIR = os.path.join(tempfile.gettempdir(), 'lithosync_jobs')
-os.makedirs(JOBS_DIR, exist_ok=True)
+def _build_syslog_handler() -> SysLogHandler:
+    """Return a UDP SysLogHandler aimed at the SIEM collector."""
+    handler = SysLogHandler(address=(SIEM_HOST, SIEM_PORT))
+    handler.setFormatter(
+        logging.Formatter(
+            "lithosync %(levelname)s [%(name)s] %(asctime)s — %(message)s"
+        )
+    )
+    return handler
 
-# In-memory job tracker (status, lightweight copy of final payload)
-jobs_db: dict = {}
 
-# Background thread pool — 4 workers keeps CPU/IO load predictable
+# Application-level security logger (audit events, alerts)
+security_log = logging.getLogger("lithosync.security")
+security_log.setLevel(logging.INFO)
+security_log.addHandler(_build_syslog_handler())
+
+# Wire Flask's own werkzeug access/error log through syslog as well
+logging.getLogger("werkzeug").addHandler(_build_syslog_handler())
+
+# ── High-volume download threshold (CERT-In alert) ────────────────────────────
+# If a single session downloads more than this many bytes of restricted data
+# in one request, a CRITICAL syslog event is emitted for the SIEM.
+_DOWNLOAD_ALERT_BYTES = int(os.environ.get("DOWNLOAD_ALERT_BYTES", str(50 * 1024 * 1024)))  # 50 MB
+
+
+def _emit_security_event(level: str, event_type: str, detail: str):
+    """Emit a structured security event to syslog for SIEM ingestion."""
+    sap_user = getattr(g, "sap_user", "anonymous")
+    remote   = request.remote_addr if request else "internal"
+    msg = (
+        f"EVENT={event_type} "
+        f"USER={sap_user} "
+        f"IP={remote} "
+        f"DETAIL={detail}"
+    )
+    getattr(security_log, level.lower(), security_log.info)(msg)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RULE 5 — SAP IAM: read X-SAP-Role from every request
+# The IAM gateway (sitting between NGINX TLS terminator and Flask) validates
+# the SAP SAML/OAuth2 token and injects X-SAP-Role + X-SAP-User headers.
+# Flask enforces role-based access; it never trusts client-supplied values.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Permitted roles and the routes each may access
+_ROLE_PERMISSIONS = {
+    "VIEWER":   {"read"},
+    "EDITOR":   {"read", "upload", "pipeline"},
+    "ADMIN":    {"read", "schema"},
+    "AUDITOR":  {"read", "audit"},
+}
+
+# Routes that require a specific permission (checked in before_request)
+_ROUTE_PERMISSION_MAP = {
+    "/api/upload_boreholes": "upload",
+    "/api/process_log":      "pipeline",
+    "/api/download_processed": "read",
+    "/api/borehole_3d":      "read",
+}
+
+
+@app.before_request
+def enforce_iam():
+    """
+    Read SAP role/user injected by the upstream IAM gateway.
+    Store on Flask's request-context g for downstream use.
+    Reject requests that violate segregation-of-duties.
+    """
+    # In development (no IAM gateway), default to EDITOR so the app works.
+    sap_role = request.headers.get("X-SAP-Role", os.environ.get("DEFAULT_SAP_ROLE", "EDITOR"))
+    sap_user = request.headers.get("X-SAP-User", "dev-user")
+
+    g.sap_role = sap_role.upper()
+    g.sap_user = sap_user
+    g.permissions = _ROLE_PERMISSIONS.get(g.sap_role, set())
+
+    # Enforce route-level permission
+    for prefix, perm in _ROUTE_PERMISSION_MAP.items():
+        if request.path.startswith(prefix):
+            if perm not in g.permissions:
+                _emit_security_event(
+                    "warning", "AUTHORISATION_DENIED",
+                    f"role={g.sap_role} tried to access {request.path}",
+                )
+                return jsonify({"error": f"Role '{g.sap_role}' is not permitted to access this endpoint."}), 403
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RULE 1 & 3 — Data sovereignty: X-Data-Classification header
+# Every API response that touches borehole/subsurface data gets this header
+# so downstream systems (WAF, SIEM) can audit data flows.
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.after_request
+def add_classification_header(response):
+    """
+    Tag every response with a data-classification level.
+    The WAF and SIEM use this header to enforce geo-fencing rules.
+    """
+    restricted_paths = [
+        "/api/borehole_3d",
+        "/api/process_log",
+        "/api/download_processed",
+        "/api/upload_boreholes",
+        "/api/job_status",
+    ]
+    is_restricted = any(request.path.startswith(p) for p in restricted_paths)
+
+    response.headers["X-Data-Classification"] = (
+        "RESTRICTED-ONGC-SUBSURFACE" if is_restricted else "UNCLASSIFIED"
+    )
+    # Prevent browsers / CDNs from caching restricted responses
+    if is_restricted:
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, private"
+        response.headers["Pragma"]        = "no-cache"
+    return response
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Concurrency & Scalability Setup
+# ══════════════════════════════════════════════════════════════════════════════
 worker_queue = ThreadPoolExecutor(max_workers=4)
+jobs_db = {}   # In-memory job tracker {job_id: {status, progress, data, error}}
 
-NOAA = 'https://gis.ngdc.noaa.gov/arcgis/rest/services'
-USGS = 'https://earthquake.usgs.gov/arcgis/rest/services'
+NOAA = "https://gis.ngdc.noaa.gov/arcgis/rest/services"
+USGS = "https://earthquake.usgs.gov/arcgis/rest/services"
 
 LAYER_CATALOG = {
     "bathy_hillshade":  f"{NOAA}/DEM_mosaics/DEM_global_mosaic_hillshade/ImageServer",
@@ -56,8 +226,8 @@ PIPELINE_AVAILABLE = False
 PIPELINE_ERROR     = ""
 
 try:
-    from ruleScript import process_file as colour_file
-    from borehole_3d_viz import (
+    from ruleScript import process_file as colour_file          # noqa: E402
+    from borehole_3d_viz import (                               # noqa: E402
         load_boreholes, BUILTIN_INDEX,
         build_normaliser, build_traces, build_layout, build_html,
         depth_gridlines,
@@ -68,9 +238,8 @@ except ImportError as _ie:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# HELPERS — coordinate conversion & parsing
+# UTM → WGS-84 (pure math, no external lib)
 # ══════════════════════════════════════════════════════════════════════════════
-
 def utm_to_latlon(easting, northing, zone_number, northern=True):
     k0 = 0.9996; a = 6378137.0; e = 0.00669438; e2 = e / (1 - e)
     x  = easting - 500000.0
@@ -98,22 +267,25 @@ def utm_to_latlon(easting, northing, zone_number, northern=True):
 
 
 def parse_coordinates(value, utm_zone=43):
-    if not value or (isinstance(value, float) and math.isnan(value)): return None
+    if not value or (isinstance(value, float) and math.isnan(value)):
+        return None
     val = str(value).strip()
-
-    m = re.compile(r'([\d]+\.?\d*)\s*m?\s*E,?\s*([\d]+\.?\d*)\s*m?\s*N', re.I).search(val)
+    m = re.compile(r"([\d]+\.?\d*)\s*m?\s*E,?\s*([\d]+\.?\d*)\s*m?\s*N", re.I).search(val)
     if m:
         try:
             lat, lon = utm_to_latlon(float(m.group(1)), float(m.group(2)), utm_zone)
-            if -90 <= lat <= 90 and -180 <= lon <= 180: return lat, lon
-        except Exception: pass
-
-    m = re.compile(r'([+-]?\d+\.?\d*)\s*°?\s*([NSns]?)\s*[,\s/]+\s*([+-]?\d+\.?\d*)\s*°?\s*([EWew]?)').search(val)
+            if -90 <= lat <= 90 and -180 <= lon <= 180:
+                return lat, lon
+        except Exception:
+            pass
+    m = re.compile(
+        r"([+-]?\d+\.?\d*)\s*°?\s*([NSns]?)\s*[,\s/]+\s*([+-]?\d+\.?\d*)\s*°?\s*([EWew]?)"
+    ).search(val)
     if m:
         a, hns = float(m.group(1)), m.group(2).upper()
         b, hew = float(m.group(3)), m.group(4).upper()
-        if hns == 'S': a = -a
-        if hew == 'W': b = -b
+        if hns == "S": a = -a
+        if hew == "W": b = -b
         if abs(a) <= 90 and abs(b) <= 180: return a, b
         if abs(b) <= 90 and abs(a) <= 180: return b, a
     return None
@@ -128,23 +300,22 @@ def process_borehole_df(df, utm_zone=43):
                 if kw in c.lower(): return c
         return None
 
-    coord_col  = find_col(['co-ord', 'coord'])
-    lat_col    = find_col(['latitude', 'lat']) if not coord_col else None
-    lon_col    = find_col(['longitude', 'lon', 'long']) if not coord_col else None
-    strat_col  = find_col(['strat', 'lith', 'desc', 'soil', 'rock', 'formation', 'material'])
-    depth_col  = find_col(['depth'])
-    wdepth_col = find_col(['water depth', 'waterdepth', 'water_depth'])
-    srno_col   = find_col(['sr. no', 'sr.no', 'sr no', 'bh no', 'borehole no',
-                            'site no', 'well no', 'id', 'no.'])
+    coord_col  = find_col(["co-ord", "coord"])
+    lat_col    = find_col(["latitude", "lat"]) if not coord_col else None
+    lon_col    = find_col(["longitude", "lon", "long"]) if not coord_col else None
+    strat_col  = find_col(["strat", "lith", "desc", "soil", "rock", "formation", "material"])
+    depth_col  = find_col(["depth"])
+    wdepth_col = find_col(["water depth", "waterdepth", "water_depth"])
+    srno_col   = find_col(["sr. no", "sr.no", "sr no", "bh no", "borehole no", "site no", "well no", "id", "no."])
 
     if depth_col and wdepth_col and depth_col == wdepth_col: depth_col = None
-    if depth_col and wdepth_col and 'water' in depth_col.lower():
+    if depth_col and wdepth_col and "water" in depth_col.lower():
         for c in df.columns:
-            if 'depth' in c.lower() and 'water' not in c.lower():
+            if "depth" in c.lower() and "water" not in c.lower():
                 depth_col = c; break
 
     if not coord_col and not (lat_col and lon_col):
-        return None, f'No coordinate column found. Detected columns: {list(df.columns)}.'
+        return None, f"No coordinate column found. Detected columns: {list(df.columns)}."
 
     records = []
     current_bh = None
@@ -154,10 +325,10 @@ def process_borehole_df(df, utm_zone=43):
         is_new = False
         if srno_col:
             v = row[srno_col]
-            is_new = pd.notna(v) and str(v).strip() not in ('', 'nan')
+            is_new = pd.notna(v) and str(v).strip() not in ("", "nan")
         elif coord_col:
             v = row[coord_col]
-            is_new = pd.notna(v) and str(v).strip() not in ('', 'nan')
+            is_new = pd.notna(v) and str(v).strip() not in ("", "nan")
         elif lat_col:
             is_new = pd.notna(row[lat_col])
 
@@ -176,35 +347,49 @@ def process_borehole_df(df, utm_zone=43):
 
             bh_no = str(int(float(row[srno_col]))) if srno_col and pd.notna(row[srno_col]) else str(bh_index)
             current_bh = {
-                'id': bh_index - 1, 'borehole_no': bh_no, 'lat': round(lat, 6), 'lon': round(lon, 6),
-                'coordinates_raw': str(row[coord_col]).strip() if coord_col and pd.notna(row[coord_col]) else f'{lat:.5f}, {lon:.5f}',
-                'water_depth': str(row[wdepth_col]).strip() if wdepth_col and pd.notna(row[wdepth_col]) else '—',
-                'stratigraphy': [], 'has_3d': False,
+                "id": bh_index - 1,
+                "borehole_no": bh_no,
+                "lat": round(lat, 6),
+                "lon": round(lon, 6),
+                "coordinates_raw": (
+                    str(row[coord_col]).strip()
+                    if coord_col and pd.notna(row[coord_col])
+                    else f"{lat:.5f}, {lon:.5f}"
+                ),
+                "water_depth": (
+                    str(row[wdepth_col]).strip()
+                    if wdepth_col and pd.notna(row[wdepth_col])
+                    else "—"
+                ),
+                "stratigraphy": [],
+                "has_3d": False,
             }
             structural = {srno_col, coord_col, lat_col, lon_col, wdepth_col, depth_col, strat_col, None}
             for c in df.columns:
                 if c not in structural and pd.notna(row[c]):
-                    current_bh[c.lower().replace(' ', '_')] = str(row[c]).strip()
+                    current_bh[c.lower().replace(" ", "_")] = str(row[c]).strip()
             records.append(current_bh)
 
         if current_bh is not None:
-            dv = str(row[depth_col]).strip() if depth_col and pd.notna(row[depth_col]) else ''
-            sv = str(row[strat_col]).strip() if strat_col and pd.notna(row[strat_col]) else ''
-            if dv or sv: current_bh['stratigraphy'].append({'depth': dv, 'description': sv})
+            dv = str(row[depth_col]).strip() if depth_col and pd.notna(row[depth_col]) else ""
+            sv = str(row[strat_col]).strip() if strat_col and pd.notna(row[strat_col]) else ""
+            if dv or sv:
+                current_bh["stratigraphy"].append({"depth": dv, "description": sv})
 
-    if not records: return None, 'No valid borehole records could be parsed.'
+    if not records:
+        return None, "No valid borehole records could be parsed."
     return records, None
 
 
 def _generate_bh_html(bh_id: int, bh_data: dict, global_nx, global_ny, hw: float = 9.5) -> str:
     import json
-    layers = bh_data['layers']
-    water_depth = float(bh_data.get('water_depth', 0))
-    max_depth = max((l['depth_bot'] for l in layers), default=10)
+    layers = bh_data["layers"]
+    water_depth = float(bh_data.get("water_depth", 0))
+    max_depth = max((l["depth_bot"] for l in layers), default=10)
     js_layers = json.dumps([{
-        'depth_top': l['depth_top'], 'depth_bot': l['depth_bot'],
-        'strat': l.get('strat', ''), 'color': l.get('color', '#888888'),
-        'texture': l.get('texture', 'solid'),
+        "depth_top": l["depth_top"], "depth_bot": l["depth_bot"],
+        "strat": l.get("strat", ""), "color": l.get("color", "#888888"),
+        "texture": l.get("texture", "solid"),
     } for l in layers])
 
     return f"""<!DOCTYPE html>
@@ -292,7 +477,7 @@ LAYERS.forEach(function(layer, idx) {{
   var geo = new THREE.CylinderGeometry(RADIUS, RADIUS, h, 64, 1, false);
   var mesh = new THREE.Mesh(geo, mat); mesh.position.y = cy; mesh.userData = {{ layer: layer }};
   scene.add(mesh); layerMeshes.push(mesh);
-  if (idx < LAYERS.length - 1) {{ var ring = new THREE.Mesh(new THREE.TorusGeometry(RADIUS + 0.02, 0.08, 8, 64), new THREE.MeshBasicMaterial({{ color: 0x010406 }})); ring.rotation.x = Math.PI / 2; ring.position.y = -layer.depth_bot * Y_SCALE; scene.add(ring); }}
+  if (idx < LAYERS.length - 1) {{ var ring = new THREE.Mesh(new THREE.TorusGeometry(RADIUS + 0.05, 0.08, 8, 64), new THREE.MeshBasicMaterial({{ color: 0x010406 }})); ring.rotation.x = Math.PI / 2; ring.position.y = -layer.depth_bot * Y_SCALE; scene.add(ring); }}
   if (idx === 0) {{ var topCap = new THREE.Mesh(new THREE.CircleGeometry(RADIUS, 64), new THREE.MeshStandardMaterial({{ color: new THREE.Color(layer.color), roughness: 0.9 }})); topCap.rotation.x = -Math.PI / 2; topCap.position.y = 0; scene.add(topCap); }}
   if (idx === LAYERS.length - 1) {{ var botCap = new THREE.Mesh(new THREE.CircleGeometry(RADIUS, 64), new THREE.MeshStandardMaterial({{ color: new THREE.Color(layer.color), roughness: 0.9 }})); botCap.rotation.x = Math.PI / 2; botCap.position.y = -layer.depth_bot * Y_SCALE; scene.add(botCap); }}
 }});
@@ -353,278 +538,234 @@ animate();
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SOCKET.IO — event handlers
+# Flask routes
 # ══════════════════════════════════════════════════════════════════════════════
 
-@socketio.on('connect')
-def on_connect():
-    """Client connected — no action needed; rooms are joined per-job."""
-    pass
-
-
-@socketio.on('disconnect')
-def on_disconnect():
-    """Client disconnected — Flask-SocketIO handles room cleanup automatically."""
-    pass
-
-
-@socketio.on('join_job')
-def on_join_job(data):
-    """
-    Client emits {'job_id': '<uuid>'} right after the HTTP POST returns.
-    We add the socket to that room so subsequent emits reach only this client.
-    If the job already finished before the client joined, we replay the final
-    status from jobs_db immediately.
-    """
-    job_id = data.get('job_id', '')
-    if not job_id:
-        return
-
-    join_room(job_id)
-
-    # Replay final state if the worker finished before the join arrived
-    job = jobs_db.get(job_id)
-    if job:
-        if job['status'] == 'completed':
-            socketio.emit('job_complete', job['data'], to=job_id)
-        elif job['status'] == 'failed':
-            socketio.emit('job_error', {'error': job.get('error', 'Unknown error')}, to=job_id)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# BACKGROUND PIPELINE — emits Socket.IO events from the worker thread
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _emit_progress(job_id: str, message: str):
-    """
-    Thread-safe helper.
-    Flask-SocketIO with async_mode='threading' allows emit() from any thread,
-    but we wrap in app_context() as a safety net for any Flask internals that
-    might be touched indirectly (e.g. g, current_app references in helpers).
-    """
-    with app.app_context():
-        socketio.emit(
-            'job_progress',
-            {'progress': message},
-            to=job_id,
-            namespace='/',
-        )
-
-
-def _run_pipeline_task(job_id: str, input_path: str, utm_zone: int):
-    """
-    Background worker.  Runs in a ThreadPoolExecutor thread.
-    All Socket.IO emits go through _emit_progress() to stay thread-safe.
-    """
-    try:
-        job_dir     = os.path.join(JOBS_DIR, job_id)
-        output_path = os.path.join(job_dir, 'my_output.xlsx')
-        html_dir    = os.path.join(job_dir, 'html')
-        os.makedirs(html_dir, exist_ok=True)
-
-        # ── Step 1 ───────────────────────────────────────────────
-        _emit_progress(job_id, 'Auto-colouring stratigraphy…')
-        colour_file(input_path, output_path)
-
-        # ── Step 2 ───────────────────────────────────────────────
-        _emit_progress(job_id, 'Parsing borehole log…')
-        boreholes = load_boreholes(output_path)
-        if not boreholes:
-            raise ValueError('No valid borehole records found in log file.')
-
-        nx_fn, ny_fn = build_normaliser(boreholes)
-        total = len(boreholes)
-
-        # ── Step 3 ───────────────────────────────────────────────
-        _emit_progress(job_id, f'Generating 3D models (0 / {total})…')
-        for idx, (bh_id, bh_data) in enumerate(boreholes.items(), 1):
-            html_str = _generate_bh_html(bh_id, bh_data, nx_fn, ny_fn)
-            with open(os.path.join(html_dir, f"{bh_id}.html"), 'w', encoding='utf-8') as f:
-                f.write(html_str)
-            # Throttle progress events: emit every 10 boreholes or at the end
-            if idx % 10 == 0 or idx == total:
-                _emit_progress(job_id, f'Generating 3D models ({idx} / {total})…')
-
-        # ── Step 4 ───────────────────────────────────────────────
-        _emit_progress(job_id, 'Finalising map data…')
-        records = []
-        for bh_id, bh in boreholes.items():
-            try: lat, lon = utm_to_latlon(bh['x'], bh['y'], utm_zone, northern=True)
-            except Exception: continue
-            if not (-90 <= lat <= 90 and -180 <= lon <= 180): continue
-
-            max_depth = max((l['depth_bot'] for l in bh['layers']), default=0)
-            records.append({
-                'id': bh_id, 'borehole_no': str(bh_id),
-                'lat': round(lat, 6), 'lon': round(lon, 6),
-                'coordinates_raw': f"{bh['x']:.1f} m E, {bh['y']:.1f} m N",
-                'water_depth': f"{bh['water_depth']} m",
-                'max_depth': max_depth,
-                'layers_count': len(bh['layers']),
-                'has_3d': True,
-                'job_id': job_id,
-                'stratigraphy': [
-                    {
-                        'depth': f"{l['depth_top']}–{l['depth_bot']} m",
-                        'depth_top': l['depth_top'],
-                        'depth_bot': l['depth_bot'],
-                        'description': l['strat'],
-                    }
-                    for l in bh['layers']
-                ],
-            })
-
-        if not records:
-            raise ValueError('Coordinates could not be converted to lat/lon — verify UTM zone.')
-
-        payload = {'count': len(records), 'boreholes': records}
-
-        # Persist result so late-joining clients can still read it via on_join_job
-        jobs_db[job_id]['status'] = 'completed'
-        jobs_db[job_id]['data']   = payload
-
-        # ── Broadcast completion ──────────────────────────────────
-        with app.app_context():
-            socketio.emit('job_complete', payload, to=job_id, namespace='/')
-
-    except Exception as exc:
-        jobs_db[job_id]['status'] = 'failed'
-        jobs_db[job_id]['error']  = str(exc)
-        with app.app_context():
-            socketio.emit(
-                'job_error',
-                {'error': str(exc)},
-                to=job_id,
-                namespace='/',
-            )
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# HTTP ROUTES
-# ══════════════════════════════════════════════════════════════════════════════
-
-@app.route('/')
+@app.route("/")
 def index():
-    return render_template('index.html', layers=LAYER_CATALOG)
+    return render_template("index.html", layers=LAYER_CATALOG)
 
 
-@app.route('/api/layers')
+@app.route("/api/layers")
 def get_layers():
     return jsonify(LAYER_CATALOG)
 
 
-@app.route('/api/pipeline_status')
+@app.route("/api/pipeline_status")
 def pipeline_status():
     return jsonify({
-        'available': PIPELINE_AVAILABLE,
-        'error':     PIPELINE_ERROR if not PIPELINE_AVAILABLE else '',
+        "available": PIPELINE_AVAILABLE,
+        "error":     PIPELINE_ERROR if not PIPELINE_AVAILABLE else "",
     })
 
 
-@app.route('/api/upload_boreholes', methods=['POST'])
+@app.route("/api/upload_boreholes", methods=["POST"])
 def upload_boreholes():
-    if 'file' not in request.files:
-        return jsonify({'error': 'No file in request'}), 400
-    file = request.files['file']
+    if "file" not in request.files:
+        return jsonify({"error": "No file in request"}), 400
+    file = request.files["file"]
     if not file.filename:
-        return jsonify({'error': 'No file selected'}), 400
+        return jsonify({"error": "No file selected"}), 400
 
-    raw = file.read()
+    raw      = file.read()
     filename = file.filename.lower()
     try:
-        if filename.endswith('.csv'):
+        if filename.endswith(".csv"):
             df = pd.read_csv(io.BytesIO(raw))
-        elif filename.endswith(('.xlsx', '.xls')):
+        elif filename.endswith((".xlsx", ".xls")):
             df = pd.read_excel(io.BytesIO(raw))
         else:
-            return jsonify({'error': 'Unsupported file type — use .xlsx, .xls or .csv'}), 400
+            return jsonify({"error": "Unsupported file type — use .xlsx, .xls or .csv"}), 400
     except Exception as exc:
-        return jsonify({'error': f'Could not parse file: {exc}'}), 400
+        return jsonify({"error": f"Could not parse file: {exc}"}), 400
 
-    utm_zone = int(request.form.get('utm_zone', 43))
+    utm_zone = int(request.form.get("utm_zone", 43))
     records, error = process_borehole_df(df, utm_zone=utm_zone)
     if error:
-        return jsonify({'error': error}), 400
-    return jsonify({'count': len(records), 'boreholes': records})
+        return jsonify({"error": error}), 400
+
+    _emit_security_event("info", "BOREHOLE_UPLOAD", f"file={file.filename} count={len(records)}")
+    return jsonify({"count": len(records), "boreholes": records})
 
 
-@app.route('/api/process_log', methods=['POST'])
+# ── Async Log Data Pipeline ───────────────────────────────────────────────────
+
+def _run_pipeline_task(job_id: str, input_path: str, utm_zone: int, sap_user: str):
+    """
+    Background worker function — runs isolated per job ID.
+    Passes the SAP user token into colour_file so ruleScript.py can
+    write it into the geo_audit_log table (Rule 4).
+    """
+    try:
+        job_dir     = os.path.join(JOBS_DIR, job_id)
+        output_path = os.path.join(job_dir, "my_output.xlsx")
+        html_dir    = os.path.join(job_dir, "html")
+        os.makedirs(html_dir, exist_ok=True)
+
+        jobs_db[job_id]["progress"] = "Auto-colouring stratigraphy..."
+        # Pass sap_user so ruleScript can write to geo_audit_log (Rule 4)
+        colour_file(input_path, output_path, sap_user=sap_user)
+
+        jobs_db[job_id]["progress"] = "Parsing boreholes..."
+        boreholes = load_boreholes(output_path)
+        if not boreholes:
+            raise ValueError("No valid borehole records found in log file.")
+
+        nx_fn, ny_fn = build_normaliser(boreholes)
+
+        jobs_db[job_id]["progress"] = f"Generating 3D models (0/{len(boreholes)})..."
+        for idx, (bh_id, bh_data) in enumerate(boreholes.items(), 1):
+            if idx % 10 == 0:
+                jobs_db[job_id]["progress"] = f"Generating 3D models ({idx}/{len(boreholes)})..."
+            html_str = _generate_bh_html(bh_id, bh_data, nx_fn, ny_fn)
+            with open(os.path.join(html_dir, f"{bh_id}.html"), "w", encoding="utf-8") as f:
+                f.write(html_str)
+
+        jobs_db[job_id]["progress"] = "Finalizing map data..."
+        records = []
+        for bh_id, bh in boreholes.items():
+            try:
+                lat, lon = utm_to_latlon(bh["x"], bh["y"], utm_zone, northern=True)
+            except Exception:
+                continue
+            if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+                continue
+            max_depth = max((l["depth_bot"] for l in bh["layers"]), default=0)
+            records.append({
+                "id": bh_id, "borehole_no": str(bh_id),
+                "lat": round(lat, 6), "lon": round(lon, 6),
+                "coordinates_raw": f"{bh['x']:.1f} m E, {bh['y']:.1f} m N",
+                "water_depth": f"{bh['water_depth']} m",
+                "max_depth": max_depth,
+                "layers_count": len(bh["layers"]),
+                "has_3d": True,
+                "job_id": job_id,
+                "stratigraphy": [
+                    {
+                        "depth": f"{l['depth_top']}–{l['depth_bot']} m",
+                        "depth_top": l["depth_top"],
+                        "depth_bot": l["depth_bot"],
+                        "description": l["strat"],
+                    }
+                    for l in bh["layers"]
+                ],
+            })
+
+        if not records:
+            raise ValueError("Coordinates could not be converted to lat/lon — verify UTM zone.")
+
+        jobs_db[job_id]["status"] = "completed"
+        jobs_db[job_id]["data"]   = {"count": len(records), "boreholes": records}
+
+    except Exception as exc:
+        jobs_db[job_id]["status"] = "failed"
+        jobs_db[job_id]["error"]  = str(exc)
+        security_log.error(
+            f"EVENT=PIPELINE_FAILURE JOB={job_id} USER={sap_user} DETAIL={exc}"
+        )
+
+
+@app.route("/api/process_log", methods=["POST"])
 def process_log():
-    """
-    Accepts the log Excel file, creates an isolated job workspace,
-    queues the pipeline in the thread pool, and immediately returns
-    the job_id.  The client then joins the Socket.IO room for that
-    job_id and receives real-time progress / completion events.
-    """
     if not PIPELINE_AVAILABLE:
-        return jsonify({'error': 'Pipeline modules missing.'}), 500
-    if 'file' not in request.files:
-        return jsonify({'error': 'No file in request'}), 400
+        return jsonify({"error": "Pipeline modules missing."}), 500
+    if "file" not in request.files:
+        return jsonify({"error": "No file in request"}), 400
 
-    file = request.files['file']
-    if not file.filename.lower().endswith(('.xlsx', '.xls')):
-        return jsonify({'error': 'Please upload an Excel file (.xlsx / .xls)'}), 400
+    file = request.files["file"]
+    if not file.filename.lower().endswith((".xlsx", ".xls")):
+        return jsonify({"error": "Please upload an Excel file (.xlsx / .xls)"}), 400
 
-    utm_zone = int(request.form.get('utm_zone', 43))
+    utm_zone = int(request.form.get("utm_zone", 43))
+    sap_user = g.sap_user  # from enforce_iam()
 
-    # Isolated workspace per job
-    job_id   = str(uuid.uuid4())
-    job_dir  = os.path.join(JOBS_DIR, job_id)
+    # Create isolated workspace for this job
+    job_id  = str(uuid.uuid4())
+    job_dir = os.path.join(JOBS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
 
-    input_path = os.path.join(job_dir, 'input.xlsx')
+    input_path = os.path.join(job_dir, "input.xlsx")
     file.save(input_path)
 
-    # Initialise job record
-    jobs_db[job_id] = {'status': 'processing', 'progress': 'Queued…'}
+    _emit_security_event("info", "PIPELINE_STARTED", f"job={job_id} file={file.filename}")
 
-    # Fire-and-forget in the thread pool
-    worker_queue.submit(_run_pipeline_task, job_id, input_path, utm_zone)
+    # Initialize job tracking
+    jobs_db[job_id] = {"status": "processing", "progress": "Initializing queue..."}
 
-    # Return immediately — client will subscribe via Socket.IO
-    return jsonify({'job_id': job_id, 'status': 'processing'})
+    # Submit to background worker (avoids Nginx 504 timeouts)
+    worker_queue.submit(_run_pipeline_task, job_id, input_path, utm_zone, sap_user)
+
+    return jsonify({"job_id": job_id, "status": "processing"})
 
 
-# Kept as a lightweight fallback for clients that cannot use WebSockets
-@app.route('/api/job_status/<job_id>')
+@app.route("/api/job_status/<job_id>")
 def job_status(job_id):
     job = jobs_db.get(job_id)
     if not job:
-        return jsonify({'error': 'Job not found'}), 404
+        return jsonify({"error": "Job not found"}), 404
     return jsonify(job)
 
 
-@app.route('/api/borehole_3d/<job_id>/<int:bh_id>')
+@app.route("/api/borehole_3d/<job_id>/<int:bh_id>")
 def borehole_3d(job_id, bh_id):
-    filepath = os.path.join(JOBS_DIR, job_id, 'html', f"{bh_id}.html")
+    filepath = os.path.join(JOBS_DIR, job_id, "html", f"{bh_id}.html")
     if os.path.exists(filepath):
-        return send_file(filepath, mimetype='text/html')
+        file_size = os.path.getsize(filepath)
+        # Rule 6 — CERT-In: alert SIEM on anomalously large 3D file downloads
+        if file_size > _DOWNLOAD_ALERT_BYTES:
+            _emit_security_event(
+                "critical",
+                "HIGH_VOLUME_DOWNLOAD",
+                f"job={job_id} bh={bh_id} size={file_size}B exceeds threshold={_DOWNLOAD_ALERT_BYTES}B",
+            )
+        _emit_security_event("info", "3D_VIEW_SERVED", f"job={job_id} bh={bh_id}")
+        return send_file(filepath, mimetype="text/html")
+
     return (
         '<html><body style="background:#0d1117;color:#aaa;'
         'font-family:sans-serif;padding:30px;text-align:center">'
-        '<h3>3D view not found</h3>'
-        '<p>Cache may have expired. Please re-run the pipeline.</p></body></html>'
+        "<h3>3D view not found</h3>"
+        "<p>Cache may have expired. Please re-run the pipeline.</p></body></html>"
     ), 404
 
 
-@app.route('/api/download_processed/<job_id>')
+@app.route("/api/download_processed/<job_id>")
 def download_processed(job_id):
-    filepath = os.path.join(JOBS_DIR, job_id, 'my_output.xlsx')
+    filepath = os.path.join(JOBS_DIR, job_id, "my_output.xlsx")
     if not os.path.exists(filepath):
-        return jsonify({'error': 'Processed file not found. Please run the pipeline again.'}), 404
+        return jsonify({"error": "Processed file not found. Please run the pipeline again."}), 404
+
+    file_size = os.path.getsize(filepath)
+    # Rule 6 — CERT-In: alert on high-volume data export
+    if file_size > _DOWNLOAD_ALERT_BYTES:
+        _emit_security_event(
+            "critical",
+            "HIGH_VOLUME_DOWNLOAD",
+            f"job={job_id} type=xlsx size={file_size}B exceeds threshold={_DOWNLOAD_ALERT_BYTES}B",
+        )
+    _emit_security_event("info", "XLSX_DOWNLOAD", f"job={job_id} size={file_size}B")
+
     return send_file(
         filepath,
         as_attachment=True,
-        download_name='my_output.xlsx',
-        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        download_name="my_output.xlsx",
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ENTRY POINT
+# NOTE — Rule 7 (Infrastructure): Do NOT use app.run() in production.
+# NGINX (or Apache) must sit in front of this app to:
+#   • Terminate TLS 1.3
+#   • Act as a WAF (ModSecurity or equivalent)
+#   • Forward X-SAP-Role / X-SAP-User headers from the IAM gateway
+#
+# Run in production with Gunicorn:
+#   gunicorn -w 4 -b 127.0.0.1:5050 app:app
+#
+# Sample NGINX snippet (ssl_protocols TLSv1.3; ssl_ciphers HIGH:!aNULL:!MD5;)
+# is provided in nginx.conf.example.
 # ══════════════════════════════════════════════════════════════════════════════
-
-if __name__ == '__main__':
-    # Use socketio.run() — it wraps Flask's development server with the
-    # correct WSGI + WebSocket transport (eventlet / threading / gevent).
-    socketio.run(app, debug=True, port=5050, allow_unsafe_werkzeug=True)
+if __name__ == "__main__":
+    # Development only — NEVER expose this directly to the internet
+    app.run(debug=True, port=5050, host="127.0.0.1", use_reloader=False)

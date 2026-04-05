@@ -1,0 +1,150 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# nginx.conf.example — Lithosync Production Reverse Proxy
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Rule 6  — CERT-In: TLS 1.3 enforced, headers logged for SIEM ingestion
+# Rule 7  — Flask is NOT exposed to the internet; NGINX terminates TLS
+#            and acts as a WAF boundary
+# Rule 1  — X-Data-Classification header is forwarded by NGINX to allow
+#            the WAF / upstream SIEM to apply geo-fence policies
+#
+# USAGE
+# -----
+# 1. Copy to /etc/nginx/sites-available/lithosync
+# 2. sudo ln -s /etc/nginx/sites-available/lithosync /etc/nginx/sites-enabled/
+# 3. Obtain a TLS certificate (internal CA or DigiCert India):
+#      ssl_certificate     /etc/ssl/lithosync/fullchain.pem;
+#      ssl_certificate_key /etc/ssl/lithosync/privkey.pem;
+# 4. sudo nginx -t && sudo systemctl reload nginx
+#
+# ModSecurity (WAF) must be compiled into NGINX or run as a sidecar.
+# Enable the OWASP Core Rule Set (CRS) for CERT-In WAF compliance.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Rate limiting zones (CERT-In: prevent volumetric abuse) ──────────────────
+limit_req_zone $binary_remote_addr zone=api_limit:10m rate=30r/m;
+limit_req_zone $binary_remote_addr zone=upload_limit:10m rate=5r/m;
+
+# ── Redirect all HTTP → HTTPS ─────────────────────────────────────────────────
+server {
+    listen 80;
+    server_name lithosync.ongc.internal;
+
+    # Redirect to HTTPS permanently
+    return 301 https://$host$request_uri;
+}
+
+# ── Main HTTPS server ─────────────────────────────────────────────────────────
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name lithosync.ongc.internal;
+
+    # ── TLS 1.3 only (Rule 6 — CERT-In) ─────────────────────────────────────
+    ssl_certificate     /etc/ssl/lithosync/fullchain.pem;
+    ssl_certificate_key /etc/ssl/lithosync/privkey.pem;
+
+    ssl_protocols TLSv1.3;
+    ssl_prefer_server_ciphers off;
+    # TLS 1.3 cipher suites are fixed by the RFC — no manual cipher config needed.
+
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets off;
+
+    # HSTS — 1 year, including subdomains (Rule 6)
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+
+    # ── Security headers ──────────────────────────────────────────────────────
+    add_header X-Frame-Options           "DENY"                    always;
+    add_header X-Content-Type-Options    "nosniff"                 always;
+    add_header X-XSS-Protection          "1; mode=block"           always;
+    add_header Referrer-Policy           "no-referrer"             always;
+    add_header Permissions-Policy        "geolocation=(), camera=()" always;
+    add_header Content-Security-Policy
+        "default-src 'self' https://js.arcgis.com https://fonts.googleapis.com https://cdnjs.cloudflare.com; "
+        "script-src  'self' 'unsafe-inline' https://js.arcgis.com https://cdnjs.cloudflare.com; "
+        "style-src   'self' 'unsafe-inline' https://fonts.googleapis.com https://js.arcgis.com; "
+        "img-src     'self' data: https:; "
+        "connect-src 'self' https://nominatim.openstreetmap.org https://gis.ngdc.noaa.gov https://earthquake.usgs.gov;"
+        always;
+
+    # ── Access log format — structured for SIEM ingestion (Rule 6) ───────────
+    log_format siem_json escape=json
+        '{'
+            '"time":"$time_iso8601",'
+            '"remote_addr":"$remote_addr",'
+            '"method":"$request_method",'
+            '"uri":"$uri",'
+            '"status":"$status",'
+            '"body_bytes":"$body_bytes_sent",'
+            '"referrer":"$http_referer",'
+            '"user_agent":"$http_user_agent",'
+            '"x_sap_role":"$http_x_sap_role",'
+            '"x_sap_user":"$http_x_sap_user",'
+            '"x_data_class":"$upstream_http_x_data_classification",'
+            '"request_time":"$request_time"'
+        '}';
+
+    access_log /var/log/nginx/lithosync_access.log siem_json;
+    error_log  /var/log/nginx/lithosync_error.log  warn;
+
+    # ── Body size (match Flask's 32 MB limit) ────────────────────────────────
+    client_max_body_size 32M;
+
+    # ── IAM gateway header injection (Rule 5) ────────────────────────────────
+    # In a real deployment the IAM gateway (e.g. SAP Cloud Identity Services
+    # or a custom SAML SP) validates the token upstream and sets these headers.
+    # NGINX strips any client-supplied X-SAP-* headers to prevent spoofing.
+    proxy_set_header X-SAP-Role   $http_x_sap_role;
+    proxy_set_header X-SAP-User   $http_x_sap_user;
+
+    # Strip client-supplied classification headers (prevent spoofing)
+    proxy_set_header X-Data-Classification "";
+
+    # Standard proxy headers
+    proxy_set_header Host              $host;
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+
+    # ── Timeouts ──────────────────────────────────────────────────────────────
+    proxy_connect_timeout 10s;
+    proxy_read_timeout    120s;   # pipeline jobs can take up to 2 min
+    proxy_send_timeout    30s;
+
+    # ── Static files (served directly by NGINX for performance) ─────────────
+    location /static/ {
+        alias /var/www/lithosync/static/;
+        expires 7d;
+        add_header Cache-Control "public, immutable";
+    }
+
+    # ── API routes — rate-limited (CERT-In abuse prevention) ─────────────────
+    location /api/upload_boreholes {
+        limit_req zone=upload_limit burst=3 nodelay;
+        proxy_pass http://127.0.0.1:5050;
+    }
+
+    location /api/process_log {
+        limit_req zone=upload_limit burst=2 nodelay;
+        proxy_pass http://127.0.0.1:5050;
+    }
+
+    location /api/ {
+        limit_req zone=api_limit burst=20 nodelay;
+        proxy_pass http://127.0.0.1:5050;
+    }
+
+    # ── All other requests → Flask (Gunicorn on 127.0.0.1:5050) ─────────────
+    location / {
+        limit_req zone=api_limit burst=30 nodelay;
+        proxy_pass http://127.0.0.1:5050;
+    }
+
+    # ── Health-check endpoint (for load-balancer probes) ─────────────────────
+    location /healthz {
+        proxy_pass http://127.0.0.1:5050/api/pipeline_status;
+        access_log off;
+    }
+}

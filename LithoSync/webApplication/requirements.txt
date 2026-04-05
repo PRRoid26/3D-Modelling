@@ -1,5 +1,21 @@
+# Lithosync — Python dependencies
+# Install with: pip install -r requirements.txt
+
+# ── Core ──────────────────────────────────────────────────────────────────────
 flask>=3.0.0
-pandas>=2.0.0
-openpyxl>=3.1.0
-xlrd>=2.0.0
-Flask-SocketIO>=5.3.0
+pandas>=2.1.0
+openpyxl>=3.1.2
+
+# ── Rule 4: COBIT audit trail — PostgreSQL driver ─────────────────────────────
+# psycopg2-binary is fine for most deployments.
+# For production on RHEL/CentOS use psycopg2 compiled against the system libpq.
+psycopg2-binary>=2.9.9
+
+# ── Rule 6: CERT-In 180-day archiving scheduler ───────────────────────────────
+APScheduler>=3.10.4
+
+# ── Rule 7: Production WSGI server (NEVER use flask run in production) ─────────
+gunicorn>=21.2.0
+
+# ── Optional: SQLAlchemy for ORM-level DB access (already readable by app.py) ──
+# sqlalchemy>=2.0.0
