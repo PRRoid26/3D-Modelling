@@ -8,7 +8,7 @@ logging.basicConfig(
 )
 
 """
-Lithosync — Flask Backend
+Fugro — Flask Backend
 =========================
 Security-hardened version compliant with:
   • Rule 1 & 3  — Geo-fence / data sovereignty  (X-Data-Classification header)
@@ -18,9 +18,9 @@ Security-hardened version compliant with:
   • Rule 6      — CERT-In compliance              (Syslog → SIEM, 180-day archive)
 """
 
-from flask import Flask, render_template, request, jsonify, send_file, g
+from flask import Flask, render_template, render_template_string, request, jsonify, send_file, g
 import pandas as pd
-import re, io, os, math, tempfile, sys, uuid, logging
+import re, io, os, math, tempfile, sys, uuid, logging, json
 from logging.handlers import SysLogHandler
 from concurrent.futures import ThreadPoolExecutor
 
@@ -185,6 +185,8 @@ def add_classification_header(response):
         "/api/download_processed",
         "/api/upload_boreholes",
         "/api/job_status",
+        "/api/borehole_data",
+        "/borehole/",
     ]
     is_restricted = any(request.path.startswith(p) for p in restricted_paths)
 
@@ -417,7 +419,7 @@ html,body{{width:100%;height:100%;overflow:hidden;background:#05080c}}
 <body>
 <div id="container"></div><div id="bh-label">BH-{bh_id}</div>
 <div id="tooltip"><div class="tt-type" id="tt-type"></div><div class="tt-depth" id="tt-depth"></div><div class="tt-desc" id="tt-desc"></div></div>
-<div id="legend-overlay"><div class="leg-title">Lithology Index</div><div id="leg-rows"></div></div>
+<div id="legend-overlay"><div class="leg-title">Fugro Index</div><div id="leg-rows"></div></div>
 <div id="controls-bar"><span><span class="k">drag</span>&nbsp;Rotate</span><span><span class="k">scroll</span>&nbsp;Zoom</span><span><span class="k">hover</span>&nbsp;Inspect</span></div>
 <script>
 var LAYERS = {js_layers}; var BH_ID = {bh_id}; var WATER_DEPTH = {water_depth}; var MAX_DEPTH = {max_depth};
@@ -622,6 +624,9 @@ def _run_pipeline_task(job_id: str, input_path: str, utm_zone: int, sap_user: st
                 f.write(html_str)
 
         jobs_db[job_id]["progress"] = "Finalizing map data..."
+        data_dir = os.path.join(job_dir, "data")
+        os.makedirs(data_dir, exist_ok=True)
+
         records = []
         for bh_id, bh in boreholes.items():
             try:
@@ -631,7 +636,7 @@ def _run_pipeline_task(job_id: str, input_path: str, utm_zone: int, sap_user: st
             if not (-90 <= lat <= 90 and -180 <= lon <= 180):
                 continue
             max_depth = max((l["depth_bot"] for l in bh["layers"]), default=0)
-            records.append({
+            record = {
                 "id": bh_id, "borehole_no": str(bh_id),
                 "lat": round(lat, 6), "lon": round(lon, 6),
                 "coordinates_raw": f"{bh['x']:.1f} m E, {bh['y']:.1f} m N",
@@ -646,10 +651,16 @@ def _run_pipeline_task(job_id: str, input_path: str, utm_zone: int, sap_user: st
                         "depth_top": l["depth_top"],
                         "depth_bot": l["depth_bot"],
                         "description": l["strat"],
+                        "color": l.get("color", "#888888"),
+                        "texture": l.get("texture", "solid"),
                     }
                     for l in bh["layers"]
                 ],
-            })
+            }
+            records.append(record)
+            # Save per-borehole JSON for detail page
+            with open(os.path.join(data_dir, f"{bh_id}.json"), "w", encoding="utf-8") as jf:
+                json.dump(record, jf)
 
         if not records:
             raise ValueError("Coordinates could not be converted to lat/lon — verify UTM zone.")
@@ -753,8 +764,156 @@ def download_processed(job_id):
     )
 
 
+@app.route("/api/borehole_data/<job_id>/<int:bh_id>")
+def borehole_data_api(job_id, bh_id):
+    """Return stored JSON record for a single borehole (used by detail page)."""
+    data_path = os.path.join(JOBS_DIR, job_id, "data", f"{bh_id}.json")
+    if not os.path.exists(data_path):
+        return jsonify({"error": "Borehole record not found"}), 404
+    with open(data_path, encoding="utf-8") as f:
+        return jsonify(json.load(f))
+
+
+_DETAIL_PAGE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BH-{{ bh_id }} — Fugro Detail</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Mono:wght@300;400;500&display=swap" rel="stylesheet"/>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --ink:#020408;--deep:#0d2035;--mid:#132c45;--surface:#1a3a55;
+  --accent:#00d4ff;--log-accent:#ff9f43;--text:#cde8f8;--muted:#6a9ab8;
+  --border:rgba(0,212,255,0.18);--radius:10px;
+}
+html,body{width:100%;height:100%;background:var(--ink);color:var(--text);font-family:'DM Mono',monospace;overflow:hidden}
+#layout{display:flex;width:100%;height:100vh}
+/* ── Left info pane ── */
+#infoPaneWrap{
+  width:38%;flex-shrink:0;display:flex;flex-direction:column;
+  border-right:1px solid var(--border);background:linear-gradient(160deg,rgba(10,22,38,0.98) 0%,rgba(13,32,53,0.99) 100%);
+  overflow:hidden;
+}
+#infoHeader{
+  padding:16px 20px;border-bottom:1px solid var(--border);flex-shrink:0;
+  background:linear-gradient(90deg,rgba(255,159,67,.15) 0%,transparent 70%);
+  display:flex;align-items:center;justify-content:space-between;
+}
+.bh-title{font-family:'Syne',sans-serif;font-size:22px;font-weight:800;color:var(--log-accent);letter-spacing:.04em}
+.bh-badge{font-size:10px;background:rgba(255,159,67,.15);border:1px solid rgba(255,159,67,.4);border-radius:12px;padding:3px 12px;color:var(--log-accent);font-weight:600}
+#infoBody{flex:1;overflow-y:auto;padding:16px 18px;scrollbar-width:thin;scrollbar-color:var(--surface) transparent}
+.section-title{
+  font-family:'Syne',sans-serif;font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.14em;
+  color:var(--muted);margin:16px 0 6px;padding-bottom:4px;border-bottom:1px solid rgba(0,212,255,.10);
+}
+.section-title:first-child{margin-top:0}
+.stat-row{display:flex;gap:8px;margin-bottom:14px}
+.stat-card{flex:1;background:rgba(0,212,255,.05);border:1px solid var(--border);border-radius:8px;padding:10px;text-align:center}
+.stat-val{font-size:18px;font-weight:700;font-family:'Syne',sans-serif;color:var(--log-accent)}
+.stat-lbl{font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin-top:2px}
+.info-row{display:flex;justify-content:space-between;align-items:flex-start;padding:5px 0;border-bottom:1px solid rgba(0,212,255,.05);gap:8px}
+.info-row:last-child{border-bottom:none}
+.info-key{color:var(--muted);text-transform:uppercase;font-size:10px;letter-spacing:.06em;flex-shrink:0}
+.info-val{color:var(--text);font-size:12px;text-align:right;word-break:break-word}
+/* strat table */
+.strat-table{width:100%;border-collapse:collapse;font-size:11px;margin-top:4px}
+.strat-table th{color:var(--muted);font-size:9px;text-transform:uppercase;letter-spacing:.06em;padding:5px 6px;border-bottom:1px solid var(--border);text-align:left}
+.strat-table td{padding:6px 6px;border-bottom:1px solid rgba(0,212,255,.05);vertical-align:top;line-height:1.45}
+.strat-table tr:last-child td{border-bottom:none}
+.strat-table tr:hover td{background:rgba(0,212,255,.05)}
+.depth-cell{color:var(--log-accent);white-space:nowrap;font-size:10px;font-weight:600;padding-right:8px}
+.color-swatch{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px;vertical-align:middle;border:1px solid rgba(255,255,255,.2)}
+::-webkit-scrollbar{width:5px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--surface);border-radius:3px}
+/* ── Right 3D pane ── */
+#vizPane{flex:1;display:flex;flex-direction:column;background:#000;min-width:0}
+#vizHeader{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:11px 18px;flex-shrink:0;
+  background:rgba(255,159,67,.06);border-bottom:1px solid rgba(255,159,67,.15);
+  font-family:'Syne',sans-serif;font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--log-accent);
+}
+.viz-hint{font-size:10px;color:var(--muted);letter-spacing:0;font-family:'DM Mono',monospace;font-weight:400}
+.viz-pulse{width:7px;height:7px;border-radius:50%;background:var(--log-accent);animation:pulse 2s infinite;display:inline-block;margin-right:8px}
+#bhFrame{flex:1;width:100%;border:none;display:block}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+/* loading */
+#loadMsg{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:var(--ink);z-index:10;flex-direction:column;gap:12px;pointer-events:none}
+#loadMsg.hidden{display:none}
+.load-spin{width:32px;height:32px;border:3px solid rgba(255,159,67,.2);border-top-color:var(--log-accent);border-radius:50%;animation:spin 0.8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<div id="layout">
+  <div id="infoPaneWrap">
+    <div id="infoHeader">
+      <span class="bh-title">BH-{{ bh_id }}</span>
+      <span class="bh-badge">⚙ 3D READY</span>
+    </div>
+    <div id="infoBody">
+      <div id="statsRow" class="stat-row"></div>
+      <div class="section-title">📍 Location</div>
+      <div id="locRows"></div>
+      <div class="section-title" id="stratTitle" style="display:none">⛏ Stratigraphy</div>
+      <table class="strat-table" id="stratTable" style="display:none">
+        <thead><tr><th>Depth</th><th>Description</th></tr></thead>
+        <tbody id="stratBody"></tbody>
+      </table>
+    </div>
+  </div>
+  <div id="vizPane">
+    <div id="vizHeader">
+      <span><span class="viz-pulse"></span>3D Stratigraphic View</span>
+      <span class="viz-hint">Drag → rotate &nbsp;·&nbsp; Scroll → zoom &nbsp;·&nbsp; Hover → inspect</span>
+    </div>
+    <div style="position:relative;flex:1;display:flex;flex-direction:column">
+      <div id="loadMsg"><div class="load-spin"></div><span style="font-size:11px;color:var(--muted)">Loading 3D model…</span></div>
+      <iframe id="bhFrame" src="/api/borehole_3d/{{ job_id }}/{{ bh_id }}" onload="document.getElementById('loadMsg').classList.add('hidden')"></iframe>
+    </div>
+  </div>
+</div>
+<script>
+fetch('/api/borehole_data/{{ job_id }}/{{ bh_id }}')
+  .then(r=>r.json()).then(bh=>{
+    // Stats
+    const stats=[];
+    if(bh.max_depth!=null) stats.push({v:bh.max_depth+' m',l:'Max Depth'});
+    if(bh.water_depth)     stats.push({v:bh.water_depth,l:'Water Depth'});
+    if(bh.layers_count!=null) stats.push({v:bh.layers_count+' strat.',l:'Layers'});
+    document.getElementById('statsRow').innerHTML=stats.map(s=>
+      `<div class="stat-card"><div class="stat-val">${s.v}</div><div class="stat-lbl">${s.l}</div></div>`
+    ).join('');
+    // Location
+    const loc=[['Borehole No.',bh.borehole_no],['Latitude',bh.lat?(bh.lat.toFixed(6)+'°'):null],['Longitude',bh.lon?(bh.lon.toFixed(6)+'°'):null],['UTM Coords',bh.coordinates_raw]];
+    document.getElementById('locRows').innerHTML=loc.filter(([,v])=>v&&v!=='undefined').map(([k,v])=>
+      `<div class="info-row"><span class="info-key">${k}</span><span class="info-val">${v}</span></div>`
+    ).join('');
+    // Stratigraphy
+    if(bh.stratigraphy&&bh.stratigraphy.length){
+      document.getElementById('stratTitle').style.display='';
+      document.getElementById('stratTable').style.display='';
+      document.getElementById('stratBody').innerHTML=bh.stratigraphy.map(l=>
+        `<tr><td class="depth-cell">${l.depth||'—'}</td><td>${l.color?`<span class="color-swatch" style="background:${l.color}"></span>`:''}${l.description||'—'}</td></tr>`
+      ).join('');
+    }
+  }).catch(()=>{});
+</script>
+</body>
+</html>"""
+
+
+@app.route("/borehole/<job_id>/<int:bh_id>")
+def borehole_detail(job_id, bh_id):
+    """Full-page borehole detail view — opens in a new tab from the map."""
+    _emit_security_event("info", "DETAIL_PAGE_SERVED", f"job={job_id} bh={bh_id}")
+    return render_template_string(_DETAIL_PAGE, job_id=job_id, bh_id=bh_id)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
-# NOTE — Rule 7 (Infrastructure): Do NOT use app.run() in production.
 # NGINX (or Apache) must sit in front of this app to:
 #   • Terminate TLS 1.3
 #   • Act as a WAF (ModSecurity or equivalent)

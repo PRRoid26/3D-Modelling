@@ -3,9 +3,9 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Lithosync</title>
+  <title>Fugro</title>
 
-  <link rel="icon" type="image/png" href="/static/images/logoLithosync-removebg-preview.png" />
+  <link rel="icon" type="image/png" href="/static/images/Gemini_Generated_Image_ny1vkqny1vkqny1v-removebg-preview.png" />
   <link rel="stylesheet" href="https://js.arcgis.com/4.29/esri/themes/dark/main.css" />
   
   <!-- 1. MUST BE FIRST: Load Socket.IO so it doesn't collide with ArcGIS -->
@@ -457,24 +457,87 @@
     }
     .utm-zone-input:focus { border-color:var(--accent); }
     .utm-hint { font-size:10px; color:var(--muted); margin-top:4px; line-height:1.4; }
+    /* ── Borehole hover tooltip ─────────────────────────────────────────── */
+    #bhHoverTip {
+      position: absolute; z-index: 25; pointer-events: none;
+      display: none; width: 230px;
+      background: rgba(8, 16, 28, 0.97);
+      border: 1px solid rgba(255, 159, 67, 0.55);
+      border-left: 3px solid var(--log-accent);
+      border-radius: 0 10px 10px 0;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.7);
+      backdrop-filter: blur(16px);
+      overflow: hidden;
+      animation: tipFadeIn .12s ease-out;
+    }
+    @keyframes tipFadeIn { from { opacity:0; transform:translateY(4px); } to { opacity:1; transform:translateY(0); } }
+    #bhHoverTip .tip-header {
+      padding: 8px 11px 6px;
+      background: linear-gradient(90deg, rgba(255,159,67,.18) 0%, transparent 80%);
+      border-bottom: 1px solid rgba(255,159,67,.15);
+      display: flex; align-items: center; justify-content: space-between;
+    }
+    #bhHoverTip .tip-bh-id {
+      font-family: 'Syne', sans-serif; font-size: 14px; font-weight: 800;
+      color: var(--log-accent); letter-spacing: .03em;
+    }
+    #bhHoverTip .tip-badge {
+      font-size: 9px; color: var(--log-accent); opacity: .7; letter-spacing: .06em;
+    }
+    #bhHoverTip .tip-stats {
+      display: flex; gap: 0; border-bottom: 1px solid rgba(255,159,67,.10);
+    }
+    #bhHoverTip .tip-stat {
+      flex: 1; padding: 6px 8px; text-align: center;
+      border-right: 1px solid rgba(255,159,67,.10);
+    }
+    #bhHoverTip .tip-stat:last-child { border-right: none; }
+    #bhHoverTip .tip-stat-val { font-size: 13px; font-weight: 700; color: var(--log-accent); font-family: 'Syne', sans-serif; }
+    #bhHoverTip .tip-stat-lbl { font-size: 8px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; margin-top: 1px; }
+    #bhHoverTip .tip-layers { padding: 6px 10px 8px; }
+    #bhHoverTip .tip-layer-row {
+      display: flex; gap: 6px; align-items: flex-start;
+      padding: 3px 0; border-bottom: 1px solid rgba(0,212,255,.05);
+      font-size: 10px;
+    }
+    #bhHoverTip .tip-layer-row:last-child { border-bottom: none; }
+    #bhHoverTip .tip-layer-depth { color: var(--log-accent); font-size: 9px; font-weight: 600; white-space: nowrap; flex-shrink: 0; padding-top: 1px; min-width: 56px; }
+    #bhHoverTip .tip-layer-desc { color: var(--text); line-height: 1.4; }
+    #bhHoverTip .tip-swatch { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 3px; vertical-align: middle; border: 1px solid rgba(255,255,255,.2); flex-shrink: 0; }
+    #bhHoverTip .tip-more { padding: 4px 10px 6px; font-size: 9px; color: var(--muted); border-top: 1px solid rgba(255,159,67,.08); }
+    #bhHoverTip .tip-click-hint {
+      padding: 5px 10px; background: rgba(255,159,67,.08);
+      font-size: 9px; color: var(--log-accent); text-align: center; letter-spacing: .04em;
+    }
   </style>
-</head>
 <body>
 
 <div id="loadingOverlay">
   <div class="load-logo-container">
-    <img src="/static/images/LithoSync.png" alt="Lithosync Logo">
+    <img src="/static/images/Untitled design.png" alt="Fugro Logo">
   </div>
-  <div class="load-sub">Initializing Lithosync GIS</div>
+  <div class="load-sub">Initializing Fugro GIS</div>
   <div class="load-bar"><div class="load-fill"></div></div>
 </div>
 
 <div id="viewDiv"></div>
 
+<!-- Borehole hover preview tooltip -->
+<div id="bhHoverTip">
+  <div class="tip-header">
+    <span class="tip-bh-id" id="tipBhId">BH-?</span>
+    <span class="tip-badge">⚙ 3D · CLICK TO EXPAND</span>
+  </div>
+  <div class="tip-stats" id="tipStats"></div>
+  <div class="tip-layers" id="tipLayers"></div>
+  <div class="tip-more" id="tipMore" style="display:none"></div>
+  <div class="tip-click-hint">🖱 Click to open full 3D view in new tab</div>
+</div>
+
 <div class="panel" id="searchPanel">
   <div id="searchInner">
     <svg viewBox="0 0 24 24" style="width:16px;height:16px;flex-shrink:0;opacity:.5;margin-right:6px"><circle cx="11" cy="11" r="8" stroke="#00d4ff" stroke-width="2" fill="none"/><line x1="16.5" y1="16.5" x2="22" y2="22" stroke="#00d4ff" stroke-width="2"/></svg>
-    <input id="searchInput" type="text" placeholder="Search Lithosync database..." autocomplete="off" />
+    <input id="searchInput" type="text" placeholder="Search Fugro database..." autocomplete="off" />
     <button id="searchBtn" title="Search">
       <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="16.5" y1="16.5" x2="22" y2="22" stroke-linecap="round"/></svg>
     </button>
@@ -1044,6 +1107,11 @@ require([
 
       if (hit) {
         const bh = logBoreholeData[hit.graphic.attributes.boreholeId];
+        if (bh && bh.has_3d && bh.job_id) {
+          // Open full detail page in a new tab
+          window.open(`/borehole/${bh.job_id}/${bh.id}`, '_blank');
+          return;
+        }
         if (bh) { showBoreholePopup(bh, evt.x, evt.y, true); return; }
       }
 
@@ -1056,6 +1124,101 @@ require([
       }
       closePopup();
     });
+  });
+
+  // ═══════════════════════════════════════════════════════════════
+  // LOG BOREHOLE HOVER TOOLTIP
+  // ═══════════════════════════════════════════════════════════════
+  const bhHoverTip   = document.getElementById('bhHoverTip');
+  const tipBhId      = document.getElementById('tipBhId');
+  const tipStats     = document.getElementById('tipStats');
+  const tipLayers    = document.getElementById('tipLayers');
+  const tipMore      = document.getElementById('tipMore');
+  let   hoverTimer   = null;
+  let   currentHover = null;
+
+  function showHoverTip(bh, screenX, screenY) {
+    if (currentHover === bh.id) return; // already showing
+    currentHover = bh.id;
+
+    tipBhId.textContent = `BH-${bh.borehole_no}`;
+
+    // Stats row
+    const stats = [];
+    if (bh.max_depth   != null) stats.push({ v: bh.max_depth + ' m',        l: 'Depth' });
+    if (bh.water_depth)         stats.push({ v: bh.water_depth,              l: 'Water' });
+    if (bh.layers_count!= null) stats.push({ v: bh.layers_count + ' layers', l: 'Strat.' });
+    tipStats.innerHTML = stats.map(s =>
+      `<div class="tip-stat"><div class="tip-stat-val">${s.v}</div><div class="tip-stat-lbl">${s.l}</div></div>`
+    ).join('');
+
+    // First 4 stratigraphy layers
+    const strat = bh.stratigraphy || [];
+    const show  = strat.slice(0, 4);
+    tipLayers.innerHTML = show.map(l => {
+      const swatch = l.color ? `<span class="tip-swatch" style="background:${l.color}"></span>` : '';
+      const desc   = (l.description || '—').substring(0, 55);
+      return `<div class="tip-layer-row">
+        <span class="tip-layer-depth">${l.depth || '—'}</span>
+        <span class="tip-layer-desc">${swatch}${desc}</span>
+      </div>`;
+    }).join('');
+
+    if (strat.length > 4) {
+      tipMore.style.display = '';
+      tipMore.textContent   = `+ ${strat.length - 4} more layer${strat.length - 4 !== 1 ? 's' : ''}…`;
+    } else {
+      tipMore.style.display = 'none';
+    }
+
+    positionTip(screenX, screenY);
+    bhHoverTip.style.display = 'block';
+  }
+
+  function positionTip(sx, sy) {
+    const tipW = 230, tipH = bhHoverTip.offsetHeight || 200;
+    const vw   = window.innerWidth, vh = window.innerHeight;
+    let   left = sx + 18, top = sy - 20;
+    if (left + tipW > vw - 12)  left = sx - tipW - 12;
+    if (top  + tipH > vh - 12)  top  = vh - tipH - 12;
+    if (top  < 12)               top  = 12;
+    bhHoverTip.style.left = left + 'px';
+    bhHoverTip.style.top  = top  + 'px';
+  }
+
+  function hideHoverTip() {
+    bhHoverTip.style.display = 'none';
+    currentHover = null;
+  }
+
+  // Debounced pointer-move to avoid hammering hitTest every frame
+  view.on('pointer-move', evt => {
+    clearTimeout(hoverTimer);
+    hoverTimer = setTimeout(() => {
+      view.hitTest(evt).then(response => {
+        const hit = response.results.find(r =>
+          r.graphic?.attributes?.isLog === true && r.graphic?.attributes?.type === 'core');
+
+        if (hit) {
+          const bh = logBoreholeData[hit.graphic.attributes.boreholeId];
+          if (bh) {
+            showHoverTip(bh, evt.x, evt.y);
+            document.getElementById('viewDiv').style.cursor = 'pointer';
+            return;
+          }
+        }
+        // Not over a log borehole — hide tip and restore cursor
+        hideHoverTip();
+        document.getElementById('viewDiv').style.cursor = '';
+      });
+    }, 60);
+  });
+
+  // Hide tip when pointer leaves the map
+  document.getElementById('viewDiv').addEventListener('mouseleave', () => {
+    clearTimeout(hoverTimer);
+    hideHoverTip();
+    document.getElementById('viewDiv').style.cursor = '';
   });
 
   function closePopup() {
@@ -1216,8 +1379,8 @@ require([
 
   // Animated status messages — stop automatically once overlay fades
   const _msgs = [
-    'Initializing Lithosync GIS',
-    'Synchronizing Lithology Data…',
+    'Initializing Fugro GIS',
+    'Synchronizing Fugro Data…',
     'Loading Basemap Layers…',
     'Preparing 3D Engine…',
     'Connecting to Esri CDN…',
